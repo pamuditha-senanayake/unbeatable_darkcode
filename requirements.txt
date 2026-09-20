@@ -1,0 +1,19 @@
+# Dependencies used by your agent, one exact pinned version per line.
+#
+#     numpy==2.1.0
+#
+# The isolated competition runtime already contains these approved versions:
+# openai==3.14.1
+# httpx==0.28.1
+# pydantic==2.13.5
+# numpy==2.1.0
+# requests==2.34.2
+# tenacity==9.0.0
+# python-dotenv==1.2.3
+#
+# No other packages, version ranges, pip options, URLs or local paths are accepted.
+# Dependencies are checked against the prepared runtime, not installed during evaluation.
+#
+# Do NOT put harness/codefest_arena-1.0.0-py3-none-any.whl here. That wheel is for your
+# laptop only. Your competition container has the agent wrapper and approved agent helpers,
+# not arena, TextArena, game source, or other teams' files.
