@@ -74,6 +74,10 @@ NOT_A_JOB = ["invoice", "wrong number", "sandwiches", "no action needed", "nothi
 FOLLOW_UP = ["hi again", "following up", "2nd message", "re:", "still nobody", "any update",
              "is this being handled", "has anyone been dispatched", "same building",
              "still ongoing", "wrote earlier", "my colleague"]
+# What a follow-up says it is about ("still nobody here about the power issue").
+TOPIC = [(["air con", "aircon", "air conditioning"], "HVAC"), (["fridge", "cold room", "freezer"], "refrigeration"),
+         (["power", "electric"], "electrical"), (["network", "wifi", "internet"], "IT"),
+         (["lift", "elevator"], "lift"), (["water", "leak", "pipe"], "plumbing")]
 DURATION_GUESS = {"HVAC": 60, "refrigeration": 60, "electrical": 45, "IT": 40, "lift": 75,
                   "plumbing": 50}
 MAX_QUEUE = 2
@@ -222,7 +226,7 @@ class Agent:
                 closes.append("[ignore %s]" % j["jid"])
                 continue
             if any(p in blob for p in FOLLOW_UP):
-                orig = self._original(j, blob, jobs, msgs, directory)
+                orig = self._original(j, blob, jobs, msgs, directory, obs)
                 if orig:
                     merges.append("[merge %s %s]" % (j["jid"], orig))
                     continue
@@ -376,17 +380,27 @@ class Agent:
         m = msgs.get(j["jid"], {})
         return (m.get("sender", j["sender"]) + " " + m.get("text", "")).lower()
 
-    def _original(self, dup, blob, jobs, msgs, directory):
+    def _original(self, dup, blob, jobs, msgs, directory, obs=""):
+        """The earlier open job this repeat is about: same customer, and when the customer
+        has several, the one whose trade matches what the follow-up says it is about."""
         who = self._customer(blob, directory)
         if who is None:
             return None
+        topic = next((trade for words, trade in TOPIC if any(w in blob for w in words)), None)
+        found = []
         for j in jobs:
             if j["jid"] == dup["jid"] or j["minute"] > dup["minute"]:
                 continue
+            if "[merge %s %s] wrong" % (dup["jid"], j["jid"]) in obs:
+                continue                          # the game already said no
             other = self._blob(j, msgs)
             # never merge into a non-request (we ignore it) or into another repeat
             if any(p in other for p in NOT_A_JOB) or any(p in other for p in FOLLOW_UP):
                 continue
             if self._customer(other, directory) == who:
-                return j["jid"]
-        return None
+                found.append((j, other))
+        if topic:
+            for j, other in found:
+                if (j["skill"] or self._trade(other)) == topic:
+                    return j["jid"]
+        return found[0][0]["jid"] if found else None
