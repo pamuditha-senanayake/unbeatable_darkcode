@@ -218,6 +218,60 @@ LLM_HIGH = 0.85             # ... to overrule the rules on a high-stakes disagre
 LLM_SURE = 0.9              # ... to take a site, or to close a ticket as not a job
 
 
+# Graph planner (_routes): max-weight matching rounds, then relocation and swap passes.
+INF = float("inf")
+GRAPH_BUDGET = 6.0              # seconds of search per _routes call
+GRAPH_UNTIL = 10.0              # seconds into a reply: use the plain insertion planner instead
+GRAPH_SWAP_PASSES = 2
+
+
+def hungarian_max(W):
+    """Max-weight assignment for an n x m matrix, n <= m. Returns row -> col."""
+    n, m = len(W), len(W[0])
+    big = max((w for row in W for w in row if w > -INF), default=0.0)
+    cost = [[0.0] * (m + 1)] + [[0.0] + [(big - w) if w > -INF else 1e9 for w in row] for row in W]
+    u, v, p, way = [0.0] * (n + 1), [0.0] * (m + 1), [0] * (m + 1), [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0], j0 = i, 0
+        minv, used = [INF] * (m + 1), [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0, delta, j1 = p[j0], INF, 0
+            for j in range(1, m + 1):
+                if not used[j]:
+                    cur = cost[i0][j] - u[i0] - v[j]
+                    if cur < minv[j]:
+                        minv[j], way[j] = cur, j0
+                    if minv[j] < delta:
+                        delta, j1 = minv[j], j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta; v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]; p[j0] = p[j1]; j0 = j1
+            if j0 == 0:
+                break
+    return {p[j] - 1: j - 1 for j in range(1, m + 1) if p[j]}
+
+
+def max_matching(W):
+    """Rectangular max-weight matching keeping only positive edges: list of (row, col)."""
+    if not W or not W[0]:
+        return []
+    n, m = len(W), len(W[0])
+    if n <= m:
+        pairs = hungarian_max(W).items()
+    else:
+        T = [[W[i][j] for i in range(n)] for j in range(m)]
+        pairs = [(i, j) for j, i in hungarian_max(T).items()]
+    return [(i, j) for i, j in pairs if W[i][j] > 0]
+
+
 class Agent:
     def __init__(self):
         self.rng = random.Random(7)
@@ -294,6 +348,7 @@ class Agent:
         shift_end = rules["shift_end"]
         byid = {j["jid"]: j for j in jobs}
         self._obs_cache = llm_reader.decode(obs) if llm_reader else {}
+        self._conf = {}                             # jid -> confidence of its urgency reading
         # tickets the customer confirmed are a repeat of an earlier one: never dispatched
         same_issue = set(re.findall(r"about (j\d+) \(problem\): \"yes - this is the same issue", obs.lower()))
         # customer sites: a job whose site is unknown is at one of these, never at the depot
@@ -370,6 +425,8 @@ class Agent:
                         (asks if prio in (1, 2, None) else asks_p3).append("[ask %s %s]" % (j["jid"], topic))
                 continue
             trade = trade or "electrical"
+            if prio is None:
+                self._conf[j["jid"]] = 0.5           # a guess: half the value is expected
             prio = prio or 2
             if zone is None and prio >= 3:
                 # A P3 with an unknown site is left: a probe ties a technician up for 10
@@ -557,6 +614,7 @@ class Agent:
             # gaps, which on level 4 are about 40 % of the tickets.
             if prio is None and c >= LLM_FILL:
                 prio = llm["prio"]
+                self._conf[jid] = c                  # node metadata: how sure the reading is
         # trade: fill a gap; never a trade the customer ruled out; overrule the rules only when
         # they fell back on a ruled-out trade, or when the model reads first (LLM_PRIMARY,
         # level 4: on paraphrased text the lists read 20 of 42 trades, the model 41 of 42)
@@ -620,7 +678,7 @@ class Agent:
         worth = value - fee - rules["travel"] * drive - rules["overtime"] * overtime - lam * (finish - free)
         return worth, finish, on_time, start
 
-    def _routes(self, plans, crew, travel, rules, lam):
+    def _routes_insertion(self, plans, crew, travel, rules, lam):
         """Full-horizon routes: each job goes where it adds the most to the whole plan
         (cheapest insertion, then relocation passes); a job that adds nothing is refused.
         Returns ({tid: [plan, ...]}, total value)."""
@@ -660,6 +718,137 @@ class Agent:
                 elif home is not None:
                     moved = True
             if not moved:
+                break
+        return routes, sum(value.values())
+
+    def _routes(self, plans, crew, travel, rules, lam):
+        """Graph planner: technicians x jobs as a weighted bipartite graph, a max-weight
+        matching per round (each technician takes the job best for the whole fleet), then
+        relocation and swap passes. Falls back to the insertion planner when the reply is
+        already late."""
+        t0 = time.monotonic()
+        spent = t0 - getattr(self, "started", t0)
+        if spent > GRAPH_UNTIL:
+            return self._routes_insertion(plans, crew, travel, rules, lam)
+        budget = min(GRAPH_BUDGET, GRAPH_UNTIL - spent)
+        sim = lambda t, seq: self._simulate(t, seq, travel, rules, lam)[0]
+        routes = {t["tid"]: [] for t in crew}
+        value = {t["tid"]: 0.0 for t in crew}
+        left = list(plans)
+
+        def best_slot(t, p):
+            if p["trade"] not in t["skills"]:
+                return -INF, None, None
+            # no edge when the technician cannot finish it before the hard stop even alone
+            if t["free_at"] + travel.get(t["at"], {}).get(p["zone"] or t["at"], 30) \
+                    + p.get("duration", 45) > rules["hard_stop"]:
+                return -INF, None, None
+            seq, best = routes[t["tid"]], (-INF, None, None)
+            for i in range(len(seq) + 1):
+                v = sim(t, seq[:i] + [p] + seq[i:])
+                if v - value[t["tid"]] > best[0]:
+                    best = (v - value[t["tid"]], i, v)
+            return best
+
+        # ---- matching rounds
+        while left and crew and time.monotonic() - t0 < budget:
+            slots = [[best_slot(t, p) for p in left] for t in crew]
+            W = [[s[0] for s in row] for row in slots]
+            pairs = max_matching(W)
+            if not pairs:
+                break
+            for i, j in pairs:
+                t, (_, pos, v) = crew[i], slots[i][j]
+                routes[t["tid"]].insert(pos, left[j])
+                value[t["tid"]] = v
+            taken = {j for _, j in pairs}
+            left = [p for k, p in enumerate(left) if k not in taken]
+
+        # ---- relocation passes (as in the base planner)
+        order = sorted(plans, key=lambda p: (-rules["value"].get(p["prio"], 0), p["deadline"]))
+        for _ in range(getattr(self, "passes", INS_PASSES)):
+            if time.monotonic() - t0 > budget:
+                break
+            moved = False
+            for p in order:
+                home = next((t for t in crew if p in routes[t["tid"]]), None)
+                if home is not None:
+                    routes[home["tid"]].remove(p)
+                    value[home["tid"]] = sim(home, routes[home["tid"]])
+                best = None
+                for t in crew:
+                    g, pos, v = best_slot(t, p)
+                    if pos is not None and (best is None or g > best[0]):
+                        best = (g, t, pos, v)
+                if best and best[0] > 0:
+                    routes[best[1]["tid"]].insert(best[2], p)
+                    value[best[1]["tid"]] = best[3]
+                    moved = moved or best[1] is not home
+                elif home is not None:
+                    moved = True
+            if not moved:
+                break
+
+        graph = self._polish(routes, crew, travel, rules, lam, t0, budget)
+        # portfolio: the insertion planner builds the chains the other way round (job by
+        # job over every technician); whichever plan is worth more for the fleet is sent
+        if time.monotonic() - t0 < budget:
+            other = self._routes_insertion(plans, crew, travel, rules, lam)
+            if other[1] > graph[1] + 1e-6:
+                return other
+        return graph
+
+    def _polish(self, routes, crew, travel, rules, lam, t0=None, budget=GRAPH_BUDGET):
+        t0 = t0 or time.monotonic()
+        sim = lambda t, seq: self._simulate(t, seq, travel, rules, lam)[0]
+        value = {t["tid"]: sim(t, routes[t["tid"]]) for t in crew}
+        for _ in range(GRAPH_SWAP_PASSES):
+            improved = False
+            for a in range(len(crew)):
+                for b in range(a + 1, len(crew)):
+                    ta, tb = crew[a], crew[b]
+                    ra, rb = routes[ta["tid"]], routes[tb["tid"]]
+                    for x in range(len(ra)):
+                        for y in range(len(rb)):
+                            if time.monotonic() - t0 > budget:
+                                break
+                            pa, pb = ra[x], rb[y]
+                            if pb["trade"] not in ta["skills"] or pa["trade"] not in tb["skills"]:
+                                continue
+                            na, nb = ra[:x] + [pb] + ra[x + 1:], rb[:y] + [pa] + rb[y + 1:]
+                            va, vb = sim(ta, na), sim(tb, nb)
+                            if va + vb > value[ta["tid"]] + value[tb["tid"]] + 1e-6:
+                                routes[ta["tid"]], routes[tb["tid"]] = na, nb
+                                ra, rb = na, nb
+                                value[ta["tid"]], value[tb["tid"]] = va, vb
+                                improved = True
+                    # tail exchange: the two routes trade everything after a cut point,
+                    # so a job chain built for one technician can end on the other's
+                    for x in range(len(ra) + 1):
+                        for y in range(len(rb) + 1):
+                            if time.monotonic() - t0 > budget or (x == len(ra) and y == len(rb)):
+                                break
+                            na, nb = ra[:x] + rb[y:], rb[:y] + ra[x:]
+                            if na == ra or any(q["trade"] not in ta["skills"] for q in na) \
+                                    or any(q["trade"] not in tb["skills"] for q in nb):
+                                continue
+                            va, vb = sim(ta, na), sim(tb, nb)
+                            if va + vb > value[ta["tid"]] + value[tb["tid"]] + 1e-6:
+                                routes[ta["tid"]], routes[tb["tid"]] = na, nb
+                                ra, rb = na, nb
+                                value[ta["tid"]], value[tb["tid"]] = va, vb
+                                improved = True
+            # in-route reorder: adjacent swaps along each chain
+            for t in crew:
+                r = routes[t["tid"]]
+                for x in range(len(r) - 1):
+                    if time.monotonic() - t0 > budget:
+                        break
+                    nr = r[:x] + [r[x + 1], r[x]] + r[x + 2:]
+                    v = sim(t, nr)
+                    if v > value[t["tid"]] + 1e-6:
+                        routes[t["tid"]], r, value[t["tid"]], improved = nr, nr, v, True
+            if not improved:
                 break
         return routes, sum(value.values())
 
@@ -735,7 +924,15 @@ class Agent:
     def _plan(self, j, zone, trade, prio, blob, directory, sites, rules):
         sla = rules["sla"].get(prio)
         deadline = rules["shift_end"] if sla is None else min(j["minute"] + sla, rules["shift_end"])
-        p = {"job": j, "zone": zone, "trade": trade, "prio": prio, "deadline": deadline, "tech": None}
+        conf = getattr(self, "_conf", {}).get(j["jid"], 1.0)
+        val = rules["value"].get(prio, 0)
+        others = [v for k, v in rules["value"].items() if k != prio] or [val]
+        p = {"job": j, "zone": zone, "trade": trade, "prio": prio, "deadline": deadline, "tech": None,
+             "value": val, "conf": conf,
+             # expected value: the read priority at its confidence, the others otherwise
+             "evalue": conf * val + (1 - conf) * sum(others) / len(others),
+             "duration": DURATION_GUESS.get(trade, 45),
+             "slack": deadline - j["minute"] - DURATION_GUESS.get(trade, 45)}
         if zone is None:
             p["cands"] = self._zone_odds(trade, blob, directory, sites)
         return p
