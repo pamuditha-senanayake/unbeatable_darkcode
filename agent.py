@@ -43,8 +43,28 @@ except Exception as _e:                             # reported below, never sile
     llm_reader = None
     LLM_IMPORT_ERROR = type(_e).__name__
     print("agent: llm_reader import failed: %s: %s" % (type(_e).__name__, _e), file=sys.stderr)
-from common import (dd_now, dd_parse_directory, dd_parse_jobs, dd_parse_messages,
-                    dd_parse_techs, dd_travel, detect_game)
+# The board parsers: our own tested copy of the reference `common` (dd_common.py), with the
+# container's `common` as a fallback for a board our copy cannot read. The two are the same
+# file on the laptop; in the competition container `common` is the organisers' copy.
+import dd_common as _parsers_local
+try:
+    import common as _parsers_cluster
+except Exception:                                   # laptop without the harness on the path
+    _parsers_cluster = None
+
+
+def _parsers(obs):
+    if _parsers_cluster is not None and _parsers_cluster is not _parsers_local:
+        try:
+            if not _parsers_local.dd_parse_techs(obs) and _parsers_cluster.dd_parse_techs(obs):
+                return _parsers_cluster
+        except Exception:
+            pass
+    return _parsers_local
+
+
+def detect_game(obs):
+    return _parsers_local.detect_game(obs)
 
 # A trade is ruled out when the customer says the obvious suspect already checked.
 EXONERATE = [
@@ -257,12 +277,13 @@ class Agent:
 
     # ------------------------------------------------------------------ the shift
     def _shift(self, obs):
-        jobs = dd_parse_jobs(obs)
-        techs = dd_parse_techs(obs)
-        travel = dd_travel(obs)
-        directory = dd_parse_directory(obs)
-        msgs = dd_parse_messages(obs)
-        now, tick, ticks = dd_now(obs)
+        P = _parsers(obs)
+        jobs = P.dd_parse_jobs(obs)
+        techs = P.dd_parse_techs(obs)
+        travel = P.dd_travel(obs)
+        directory = P.dd_parse_directory(obs)
+        msgs = P.dd_parse_messages(obs)
+        now, tick, ticks = P.dd_now(obs)
         rules = parse_rules(obs)
         shift_end = rules["shift_end"]
         byid = {j["jid"]: j for j in jobs}

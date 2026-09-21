@@ -122,7 +122,9 @@ class ModelPath(unittest.TestCase):
 
     def valid(self, reply):
         cmds = commands(reply)
-        self.assertTrue(cmds and cmds[-1] == "[wait]", reply)
+        # a reply ends in [wait], or is five certain dispatches (guards.FULL_REPLY)
+        full = len(cmds) == 5 and all(c.split()[0] in ("[assign", "[unassign") for c in cmds)
+        self.assertTrue(cmds and (cmds[-1] == "[wait]" or full), reply)
         self.assertLessEqual(len(cmds), 5, reply)
 
     def shift(self, a, seed=4):
