@@ -27,6 +27,7 @@ Scheduling (level 2 has twice the work the fleet can do, so saying no is the job
 import random
 import re
 
+import guards
 import handlers
 from common import (dd_now, dd_parse_directory, dd_parse_jobs, dd_parse_messages,
                     dd_parse_techs, dd_travel, detect_game)
@@ -388,7 +389,7 @@ class Agent:
         # P1/P2 dispatches first, then questions, then P3 dispatches; closing repeats and
         # non-requests costs nothing to put off a tick. At most four, and always [wait].
         cmds = urgent + asks + asks_p3 + later + merges + closes
-        return " ".join(cmds[:4] + ["[wait]"])
+        return " ".join(guards.legal(cmds, jobs, techs, travel))
 
     # ------------------------------------------------------------------ route planner
     def _simulate(self, t, seq, travel, rules, lam):
