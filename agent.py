@@ -293,14 +293,8 @@ class Agent:
             trade = trade or "electrical"
             prio = prio or 2
             if zone is None and prio >= 3:
-                # A P3 is not worth a probe: a wrong site ties a technician up for 10 points.
-                # Ask when the fee plus the likely drive still leaves something, and hold it.
-                if not asked(j["jid"], "location"):
-                    crew = [t for t in techs if not t["off_shift"] and trade in t["skills"]]
-                    drive = (sum(min(travel.get(t["dest"] or t["zone"], {}).get(z, 30) for t in crew)
-                                 for z in sites) / len(sites)) if crew else 99
-                    if rules["value"].get(prio, 0) - rules["fee"] - rules["travel"] * drive > 0:
-                        asks_p3.append("[ask %s location]" % j["jid"])
+                # A P3 with an unknown site is left: a probe ties a technician up for 10
+                # points, and an ask (5) rarely leaves anything once the drive is paid.
                 continue
             plans.append(self._plan(j, zone, trade, prio, blob, directory, sites, rules))
 
