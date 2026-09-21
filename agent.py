@@ -458,7 +458,12 @@ class Agent:
         ranked += [((8, 0, 0), c) for c in merges] + [((9, 0, 0), c) for c in closes]
         # the reply carries four commands: P1 work first, then P1 questions, P2 work, P2
         # questions, P3 work; merges and ignores earn nothing and wait for a free slot
-        cmds = [c for _, c in sorted(ranked, key=lambda x: x[0])]
+        ranked.sort(key=lambda x: x[0])
+        cmds = [c for _, c in ranked]
+        # the fifth slot (guards.FULL_REPLY) is only worth its risk for P1/P2 work the
+        # technician acts on before the next tick (a queued second job can wait a tick)
+        if len(ranked) >= guards.FULL_REPLY and ranked[guards.FULL_REPLY - 1][0][:2] > (2, 0):
+            cmds = cmds[:guards.MAX_COMMANDS]
         # model answers ride along outside the brackets, so a restarted agent still has them
         head = ["llm " + " ".join(notes) + " ;"] if notes else []
         out = guards.legal(cmds, jobs, techs, travel, asked_any)

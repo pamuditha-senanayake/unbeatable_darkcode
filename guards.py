@@ -16,6 +16,12 @@ import re
 CMD = re.compile(r"\[([^\[\]]*)\]")
 TOPICS = ("location", "problem", "urgency")
 MAX_COMMANDS = 4
+# The game reads five commands. The fifth slot is used, and the trailing [wait] dropped, only
+# when all five are dispatches the game cannot reject: an assign of a job that is UNASSIGNED
+# or queued (never one a technician is already driving to), or an unassign of a queued or
+# travelling job. The board does not change between the observation and the reply, so such
+# a command is accepted for certain, and one accepted command is all a valid reply needs.
+FULL_REPLY = 5
 
 
 def legal(cmds, jobs, techs, zones, asked_before=()):
@@ -29,6 +35,7 @@ def legal(cmds, jobs, techs, zones, asked_before=()):
     tech = {t["tid"]: t for t in techs}
     zones = set(zones)
     kept, seen, assigned, asked = [], set(), set(), set(asked_before)
+    certain = []                                  # per kept command: accepted for certain?
     for raw in cmds:
         m = CMD.fullmatch(raw.strip())
         if not m:
@@ -37,7 +44,7 @@ def legal(cmds, jobs, techs, zones, asked_before=()):
         if not parts or raw in seen:
             continue
         verb, args = parts[0].lower(), parts[1:]
-        ok = False
+        ok, sure = False, False
         if verb == "assign" and len(args) in (2, 3):
             t, j = tech.get(args[0]), byid.get(args[1])
             zone_ok = (len(args) == 3 and args[2] in zones) or (len(args) == 2 and j is not None and j["zone"])
@@ -47,9 +54,11 @@ def legal(cmds, jobs, techs, zones, asked_before=()):
                   and j["status"] != "in_progress" and args[1] not in assigned)
             if ok:
                 assigned.add(args[1])
+                sure = j["status"] in ("unassigned", "queued")
         elif verb == "unassign" and len(args) == 1:
             j = byid.get(args[0])
             ok = j is not None and j["status"] in ("queued", "travelling")
+            sure = ok
         elif verb == "ask" and len(args) == 2:
             ok = args[0] in byid and args[1] in TOPICS and args[0] not in asked
             if ok:
@@ -64,6 +73,9 @@ def legal(cmds, jobs, techs, zones, asked_before=()):
         if ok:
             kept.append(raw)
             seen.add(raw)
-        if len(kept) == MAX_COMMANDS:
+            certain.append(sure)
+        if len(kept) == FULL_REPLY:
             break
-    return kept + ["[wait]"]
+    if len(kept) == FULL_REPLY and all(certain):
+        return kept                               # five dispatches the game accepts for certain
+    return kept[:MAX_COMMANDS] + ["[wait]"]
