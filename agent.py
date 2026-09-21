@@ -14,11 +14,10 @@ Reading (no model in the loop):
 
 Scheduling (level 2 has twice the work the fleet can do, so saying no is the job):
 
-* Re-plan every tick, earliest SLA deadline first. Each job goes to the technician with
-  the best expected net (value by the chance of finishing inside the SLA, minus travel,
-  overtime and the minutes it ties them up). When the fleet is overloaded a job must also
-  pay for those minutes, or it is refused.
-* A P1 that would be late recalls a technician on the road to lower-priority work.
+* Re-plan every tick over the whole horizon: each job is inserted where it adds most to
+  the technicians' routes (value by the chance of finishing inside the SLA, minus travel,
+  overtime and, when the fleet is overloaded, the minutes it ties them up); a job that adds
+  nothing is refused. Only the head of each route is sent to the game.
 * An unknown P1/P2 site is probed at the zone that minimises the expected detour, and
   asked about when the answer lands before the technician sets off.
 * Repeats are never dispatched; merged only when the original is certain (a merge earns
@@ -84,7 +83,7 @@ TOPIC = [(["air con", "aircon", "air conditioning"], "HVAC"), (["fridge", "cold 
          (["lift", "elevator"], "lift"), (["water", "leak", "pipe"], "plumbing")]
 DURATION_GUESS = {"HVAC": 60, "refrigeration": 60, "electrical": 45, "IT": 40, "lift": 75,
                   "plumbing": 50}
-MAX_QUEUE = 2
+MAX_QUEUE = 2                   # jobs sent to a technician's queue; the rest of the route waits
 # What a minute of technician time is worth to the work still to come. Charging it when
 # choosing a technician sends each job to whoever finishes it soonest; charging it when
 # deciding whether to take a job at all only pays when the fleet is overloaded (level 2 has
@@ -92,6 +91,7 @@ MAX_QUEUE = 2
 # remaining capacity, the full OPP from LOAD_HI up.
 OPP = 0.2
 LOAD_LO, LOAD_HI = 0.6, 1.0
+INS_PASSES = 2                  # relocation passes over the routes
 LOAD_UNTIL = 360                # tickets stopped arriving around 14:00 on the practice shifts
 WRONG_SITE_MIN = 15             # a visit to the wrong site costs the technician 15 minutes
 # How often each trade came from each zone over practice shifts 1-50 (levels 1 and 2, the
@@ -336,59 +336,9 @@ class Agent:
         # when there is more of it than the fleet can do.
         self.load = self._load(plans, techs, msgs, now, rules)
 
-        # ---- earliest deadline first, a P1 ahead of a P3 at the same deadline
-        plans.sort(key=lambda p: (p["deadline"], p["prio"]))
         recalls = []
-        k = 0
-        while k < len(plans):
-            p = plans[k]
-            k += 1
-            # Pick the technician with the best expected net: value earned (half if past the
-            # SLA, nothing past the 19:00 hard stop) minus travel, their own overtime and the
-            # time it ties them up. A job nobody can do at a profit is left alone.
-            best = None
-            for t in techs:
-                if p["trade"] not in t["skills"] or t["off_shift"] or len(t["queue"]) >= MAX_QUEUE:
-                    continue
-                if t["at"] not in travel:
-                    continue
-                opt = self._score(t, t["free_at"], t["at"], p, travel, rules)
-                if opt["accept"] > 0 and (best is None or opt["net"] > best["net"]):
-                    best = opt
-            # A P1 that will be late: a technician on the road to lower-priority work can be
-            # recalled. They still reach that site (the drive is sunk), take the P1 from there,
-            # and the recalled job goes back into the pool.
-            if p["prio"] == 1 and (best is None or best["on_time"] < 1):
-                for t in techs:
-                    cur = byid.get(t["job"])
-                    if t["activity"] != "travel" or not cur or cur["status"] != "travelling" or t["queue"] \
-                            or p["trade"] not in t["skills"] or t["off_shift"] or not t["dest"] or not t["until"]:
-                        continue
-                    cblob = self._blob(cur, msgs)
-                    cprio = cur["prio"] or self._priority(cblob) or 2
-                    if cprio == 1 or cur["jid"] in repeats:
-                        continue
-                    opt = self._score(t, max(now, t["until"]), t["dest"], p, travel, rules)
-                    if opt["on_time"] >= 1 and opt["accept"] > 0 and (best is None or opt["net"] > best["net"]):
-                        best = dict(opt, recall=cur, cprio=cprio, cblob=cblob)
-            p["tech"] = best and best["tech"]
-            if best is None:
-                continue
-            t = best["tech"]
-            if best.get("recall"):
-                cur = best["recall"]
-                recalls.append("[unassign %s]" % cur["jid"])
-                t["free_at"], t["at"] = max(now, t["until"]), t["dest"]
-                back = self._plan(cur, cur["zone"] or t["dest"], cur["skill"] or self._trade(best["cblob"]) or "electrical",
-                                  best["cprio"], best["cblob"], directory, sites, rules)
-                back["job"] = dict(cur, status="unassigned")
-                plans.insert(k, back)
-                plans[k:] = sorted(plans[k:], key=lambda p: (p["deadline"], p["prio"]))
-                best = self._score(t, t["free_at"], t["at"], p, travel, rules)
-            t["queue"] = t["queue"] + [(p["job"]["jid"], best["zone"])]
-            p["departs"] = t["free_at"]
-            t["free_at"] = best["finish"]
-            t["at"] = p["zone"] or best["zone"]
+        # ---- full-horizon routes, re-planned from scratch every tick
+        self._insertion(plans, techs, travel, rules, now)
 
         # ---- an unknown site: ask when the answer lands before the technician sets off (the
         # game sends them to the confirmed site then), or when nobody can take a P1/P2 yet
@@ -426,25 +376,85 @@ class Agent:
         cmds = urgent + asks + asks_p3 + later + merges + closes
         return " ".join(cmds[:4] + ["[wait]"])
 
-    def _score(self, t, free_at, at, p, travel, rules):
-        """What sending technician t (free at `free_at`, standing at `at`) to plan p is worth."""
-        duration = DURATION_GUESS[p["trade"]]
-        lo, hi = DURATION_SPREAD.get(p["trade"], (duration, duration))
-        zone, drive, delay = self._route(at, p, travel)
-        arrival = free_at + drive + delay
-        finish = arrival + duration
+    # ------------------------------------------------------------------ route planner
+    def _simulate(self, t, seq, travel, rules, lam):
+        """Walk technician t through seq: (objective, [(zone, departs, on_time)])."""
+        time_, at, total, legs = t["free_at"], t["at"], 0.0, []
         own_end = t["shift_end"] or rules["shift_end"]
-        # expected value over the likely durations: a finish a few minutes past the SLA is a
-        # coin flip, not a certainty either way
-        on_time = sum(arrival + d <= p["deadline"] for d in (lo, duration, hi)) / 3.0
-        value = rules["value"].get(p["prio"], 0) * (on_time + (1 - on_time) * rules["late"])
-        if finish > rules["hard_stop"]:
-            value = 0.0
-        overtime = max(0, finish - max(own_end, free_at))
-        base = value - rules["travel"] * drive - rules["overtime"] * overtime
-        return {"tech": t, "zone": zone, "finish": finish, "on_time": on_time,
-                "net": base - self._opp(p) * (finish - free_at),
-                "accept": base - self._accept_opp() * (finish - free_at)}
+        for p in seq:
+            zone, drive, delay = self._route(at, p, travel)
+            duration = DURATION_GUESS[p["trade"]]
+            lo, hi = DURATION_SPREAD.get(p["trade"], (duration, duration))
+            arrival = time_ + drive + delay
+            finish = arrival + duration
+            on_time = sum(arrival + d <= p["deadline"] for d in (lo, duration, hi)) / 3.0
+            value = rules["value"].get(p["prio"], 0) * (on_time + (1 - on_time) * rules["late"])
+            if finish > rules["hard_stop"]:
+                value = 0.0
+            overtime = max(0, finish - max(own_end, time_))
+            total += value - rules["travel"] * drive - rules["overtime"] * overtime - lam * (finish - time_)
+            legs.append((zone, time_, on_time))
+            time_, at = finish, p["zone"] or zone
+        return total, legs
+
+    def _insertion(self, plans, techs, travel, rules, now):
+        """Full-horizon routes: each job goes where it adds the most to the whole plan
+        (cheapest insertion, then relocation passes); a job that adds nothing is refused."""
+        lam = self._accept_opp()
+        crew = [t for t in techs if not t["off_shift"] and t["at"] in travel]
+        routes = {t["tid"]: [] for t in crew}
+        value = {t["tid"]: 0.0 for t in crew}
+
+        def best_slot(p):
+            best = None
+            for t in crew:
+                if p["trade"] not in t["skills"]:
+                    continue
+                seq = routes[t["tid"]]
+                for i in range(len(seq) + 1):
+                    cand = seq[:i] + [p] + seq[i:]
+                    v, _ = self._simulate(t, cand, travel, rules, lam)
+                    gain = v - value[t["tid"]]
+                    if best is None or gain > best[0]:
+                        best = (gain, t, i, v)
+            return best
+
+        order = sorted(plans, key=lambda p: (-rules["value"].get(p["prio"], 0), p["deadline"]))
+        for p in order:
+            b = best_slot(p)
+            if b and b[0] > 0:
+                gain, t, i, v = b
+                routes[t["tid"]].insert(i, p)
+                value[t["tid"]] = v
+        for _ in range(INS_PASSES):
+            moved = False
+            for p in order:
+                home = next((t for t in crew if p in routes[t["tid"]]), None)
+                if home is not None:
+                    seq = routes[home["tid"]]
+                    seq.remove(p)
+                    value[home["tid"]], _ = self._simulate(home, seq, travel, rules, lam)
+                b = best_slot(p)
+                if b and b[0] > 0:
+                    gain, t, i, v = b
+                    routes[t["tid"]].insert(i, p)
+                    value[t["tid"]] = v
+                    if t is not home:
+                        moved = True
+                elif home is not None:
+                    moved = True
+            if not moved:
+                break
+        # commit the head of each route; the rest waits for the next tick's re-plan
+        for t in crew:
+            seq = routes[t["tid"]]
+            _, legs = self._simulate(t, seq, travel, rules, lam)
+            for k, (p, (zone, departs, on_time)) in enumerate(zip(seq, legs)):
+                if k < MAX_QUEUE - len(t["queue"]):
+                    p["tech"], p["departs"] = t, departs
+                    t["queue"] = t["queue"] + [(p["job"]["jid"], zone)]
+                else:
+                    p["tech"], p["departs"] = t, departs      # planned, not yet sent
 
     def _plan(self, j, zone, trade, prio, blob, directory, sites, rules):
         sla = rules["sla"].get(prio)
@@ -503,11 +513,6 @@ class Agent:
         work += max(0, LOAD_UNTIL - now) * rate * 0.8 * 70
         cap = sum(max(0, (t["shift_end"] or rules["shift_end"]) - now) for t in techs if not t["off_shift"])
         return work / max(1.0, cap)
-
-    @staticmethod
-    def _opp(p):
-        """What a minute of technician time is worth to the work still to come."""
-        return OPP
 
     def _blob(self, j, msgs):
         """Sender and text, lower-cased. The job row cuts the sender at 28 characters, so
