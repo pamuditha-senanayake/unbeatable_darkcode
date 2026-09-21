@@ -212,7 +212,7 @@ class Agent:
         mine = " ".join(l for l in obs.splitlines() if l.startswith("[Player]"))
         asked = lambda jid, topic: "[ask %s %s]" % (jid, topic) in mine
 
-        closes, merges, asks, plans = [], [], [], []
+        closes, merges, asks, plans, probes = [], [], [], [], []
         for j in jobs:
             if j["status"] != "unassigned":
                 continue
@@ -241,6 +241,13 @@ class Agent:
             prio = j["prio"] or self._priority(blob)
             # Ask about whatever the text does not tell us, all in the same tick. Once an
             # answer is in, the game shows it on the row; if it is still pending, hold the job.
+            if zone is None and trade and prio in (1, 2) and not asked(j["jid"], "location"):
+                # P1/P2 with an unknown site: try to probe it (below). A P3 can afford the
+                # tick an ask takes, and probing it burns technician time for 10 points.
+                sla = rules["sla"].get(prio)
+                probes.append({"job": j, "trade": trade, "prio": prio,
+                               "deadline": shift_end if sla is None else min(j["minute"] + sla, shift_end)})
+                continue
             for value, topic in ((zone, "location"), (trade, "problem"), (prio, "urgency")):
                 if value is None:
                     if not asked(j["jid"], topic):
@@ -284,6 +291,24 @@ class Agent:
             best["queue"] = best["queue"] + [p["job"]["jid"]]
             best["free_at"] = best_arrival + DURATION_GUESS[p["trade"]]
             best["at"] = p["zone"]
+
+        # A job whose site is unknown: rather than ask (a fee and a lost tick), send an idle
+        # technician with the right skill to the zone they are already standing in. A wrong
+        # site costs them 15 minutes, reveals the true zone and they drive straight on; the
+        # drive is the one they would have made anyway. Without an idle technician, ask.
+        sites = [z for z in travel if z != "Depot"] or list(travel)
+        probes.sort(key=lambda p: (p["deadline"], p["prio"]))
+        for p in probes:
+            idle = [t for t in techs if p["trade"] in t["skills"] and not t["off_shift"] and not t["queue"]
+                    and t["activity"] == "idle" and t["zone"] and t["free_at"] <= now
+                    and now + 15 + 45 + DURATION_GUESS.get(p["trade"], 60) <= (t["shift_end"] or shift_end)]
+            if not idle or not travel:
+                asks.append("[ask %s location]" % p["job"]["jid"])
+                continue
+            t = min(idle, key=lambda t: sum(travel.get(t["zone"], {}).get(z, 30) for z in sites))
+            assigns.append("[assign %s %s %s]" % (t["tid"], p["job"]["jid"], t["zone"]))
+            t["queue"] = [p["job"]["jid"]]
+            t["free_at"] = now + 60 + DURATION_GUESS.get(p["trade"], 60)
 
         cmds = closes + merges + assigns + asks
         return " ".join(cmds[:4] + ["[wait]"])
