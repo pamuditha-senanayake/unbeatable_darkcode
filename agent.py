@@ -473,8 +473,8 @@ class Agent:
 
     def _insertion(self, plans, techs, travel, rules, now, recallable):
         """Plan the routes; when a P1 would be refused or late, also try recalling each
-        technician who is on the road to lower-priority work (they still reach that site,
-        the drive is sunk, and the job goes back into the pool). Keep whichever plan is worth
+        technician who is on the road to lower-priority work (the game sets them down at that
+        site at once, idle, and the job goes back into the pool). Keep whichever plan is worth
         more. Returns the unassign commands for the recalls made."""
         lam = self._accept_opp()
         crew = [t for t in techs if not t["off_shift"] and t["at"] in travel]
@@ -495,7 +495,7 @@ class Agent:
                 t = next((c for c in crew if c["tid"] == tid), None)
                 if t is None:
                     continue
-                there = dict(t, free_at=max(now, t["until"]), at=t["dest"])
+                there = dict(t, free_at=now, at=t["dest"])   # the game puts them there at once
                 kept, _ = self._simulate(there, [back], travel, rules, lam)   # the job as it goes now
                 alt_crew = [there if c is t else c for c in crew]
                 alt_routes, alt_total = self._routes(plans + [back], alt_crew, travel, rules, lam)
