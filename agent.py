@@ -522,9 +522,10 @@ class Agent:
             if prio is None:
                 if c >= LLM_FILL:
                     prio = llm["prio"]
-            elif llm["prio"] == 1 and prio != 1 and (c >= LLM_HIGH or LLM_PRIMARY):
-                prio = 1
-            elif LLM_PRIMARY and c >= LLM_FILL:
+            elif LLM_PRIMARY and (llm["prio"] == 1 or c >= LLM_FILL):
+                # the rules read the wording of levels 1-3 exactly, so a confident model
+                # never overrules them there (measured: it cost 0.07 on a level-2 shift);
+                # only when the model reads first (level 4) does its priority win
                 prio = llm["prio"]
         # trade: fill a gap; never a trade the customer ruled out; overrule the rules only when
         # they fell back on a ruled-out trade (or when the model reads first, LLM_PRIMARY)
@@ -542,8 +543,10 @@ class Agent:
         if zone is None and llm["zone"] and c >= LLM_SURE and SITE_REF.search(text) \
                 and llm["zone"] in self._zone_odds(trade, blob, directory, sites):
             zone = llm["zone"]
-        # a likely repeat the rules missed: never dispatch it before the customer confirms
-        if llm["repeat_of"] and c >= LLM_HIGH and not asked(jid, "problem"):
+        # a likely repeat the rules missed: never dispatch it before the customer confirms.
+        # The rules catch every follow-up phrasing of levels 1-3, so only when the model
+        # reads first (level 4) is its repeat worth a question and a tick.
+        if LLM_PRIMARY and llm["repeat_of"] and c >= LLM_HIGH and not asked(jid, "problem"):
             ask("problem")
             hold = True
         return zone, trade, prio, extra, hold
