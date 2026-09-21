@@ -74,15 +74,63 @@ NOT_A_JOB = ["invoice", "wrong number", "sandwiches", "no action needed", "nothi
 FOLLOW_UP = ["hi again", "following up", "2nd message", "re:", "still nobody", "any update",
              "is this being handled", "has anyone been dispatched", "same building",
              "still ongoing", "wrote earlier", "my colleague"]
-SLA_MINUTES = {1: 120, 2: 240, 3: None}
 DURATION_GUESS = {"HVAC": 60, "refrigeration": 60, "electrical": 45, "IT": 40, "lift": 75,
                   "plumbing": 50}
 MAX_QUEUE = 2
-VALUE = {1: 100, 2: 40, 3: 10}
-LATE_FACTOR = 0.5
-TRAVEL_COST = 0.5          # per minute on the road
-OVERTIME_COST = 1.0        # per minute after the technician's own shift end
-HARD_STOP = 660            # 19:00, nobody works later
+
+# The rules text at the top of every episode is the authority; these are only what it said
+# on levels 1-4, used when a value cannot be read from it (the final round changes a rule).
+DEFAULT_RULES = {
+    "value": {1: 100, 2: 40, 3: 10},
+    "sla": {1: 120, 2: 240, 3: None},   # minutes after the message; None = by shift end
+    "late": 0.5,                        # share of the value earned after the SLA
+    "travel": 0.5,                      # per minute on the road
+    "overtime": 1.0,                    # per minute after a technician's own shift end
+    "fee": 5.0,                         # per question
+    "merge": 15.0,                      # per wrong merge
+    "shift_end": 540,                   # 17:00, minutes after 08:00
+    "hard_stop": 660,                   # 19:00, nobody works later
+    "tick": 30,
+}
+
+
+def _hhmm(h, m):
+    return (int(h) - 8) * 60 + int(m)
+
+
+def parse_rules(obs):
+    """Read values, SLAs and costs from the rules text (everything before the first board)."""
+    r = {k: (dict(v) if isinstance(v, dict) else v) for k, v in DEFAULT_RULES.items()}
+    head = obs[:obs.find("=== ")] if "=== " in obs else obs
+    num = r"(\d+(?:\.\d+)?)"
+    m = re.search(r"Job value[^\n]*", head)
+    if m:
+        for prio, val in re.findall(r"P([123])\s*=\s*" + num, m.group(0)):
+            r["value"][int(prio)] = float(val) if "." in val else int(val)
+    for prio in (1, 2):
+        m = re.search(r"P%d (?:must be finished |finished )?within %s\s*(h|hours?|min|minutes?)\b" % (prio, num), head)
+        if m:
+            r["sla"][prio] = int(round(float(m.group(1)) * (60 if m.group(2).startswith("h") else 1)))
+    for key, pattern in (("late", r"earns %s\s*%%" % num), ("travel", r"travel %s per minute" % num),
+                         ("overtime", r"overtime %s per minute" % num), ("fee", r"question fee %s" % num),
+                         ("merge", r"wrong merge %s" % num)):
+        m = re.search(pattern, head)
+        if m:
+            v = float(m.group(1))
+            r[key] = v / 100.0 if key == "late" else v
+    m = re.search(r"one shift, \d\d:\d\d-(\d\d):(\d\d)", head)
+    if m:
+        r["shift_end"] = _hhmm(*m.groups())
+    m = re.search(r"works past (\d\d):(\d\d)", head)
+    if m:
+        r["hard_stop"] = _hhmm(*m.groups())
+    m = re.search(r"ticks of (\d+) minutes", head)
+    if m:
+        r["tick"] = int(m.group(1))
+    return r
+
+
+BOARD_HEAD = re.compile(r"=== \d\d:\d\d \| tick \d+/\d+ \|")
 
 
 class Agent:
@@ -95,7 +143,9 @@ class Agent:
     def __call__(self, observation):
         # Never raise: a raised reply is a fault, and four faults lose the shift.
         try:
-            if detect_game(observation) != "dispatchdesk":
+            observation = observation.replace("\r\n", "\n")
+            # the intro may be missing from a cut history; a board header is enough to play
+            if detect_game(observation) != "dispatchdesk" and not BOARD_HEAD.search(observation):
                 return "[wait]"
             return self._shift(observation)
         except Exception:
@@ -150,7 +200,8 @@ class Agent:
         directory = dd_parse_directory(obs)
         msgs = dd_parse_messages(obs)
         now, tick, ticks = dd_now(obs)
-        shift_end = ticks * 30
+        rules = parse_rules(obs)
+        shift_end = rules["shift_end"]
 
         for t in techs:
             t["free_at"] = max(now, t["until"] or now) + 45 * len(t["queue"])
@@ -200,7 +251,7 @@ class Agent:
                 continue
             trade = trade or "electrical"
             prio = prio or 2
-            sla = SLA_MINUTES[prio]
+            sla = rules["sla"].get(prio)
             deadline = shift_end if sla is None else min(j["minute"] + sla, shift_end)
             plans.append({"job": j, "zone": zone, "trade": trade, "prio": prio, "deadline": deadline})
 
@@ -220,11 +271,11 @@ class Agent:
                 arrival = t["free_at"] + drive
                 finish = arrival + duration
                 own_end = t["shift_end"] or shift_end
-                value = VALUE[p["prio"]] * (1.0 if finish <= p["deadline"] else LATE_FACTOR)
-                if finish > HARD_STOP:
+                value = rules["value"].get(p["prio"], 0) * (1.0 if finish <= p["deadline"] else rules["late"])
+                if finish > rules["hard_stop"]:
                     value = 0.0
                 overtime = max(0, finish - max(own_end, t["free_at"]))
-                net = value - TRAVEL_COST * drive - OVERTIME_COST * overtime
+                net = value - rules["travel"] * drive - rules["overtime"] * overtime
                 if net > best_net:
                     best, best_arrival, best_net = t, arrival, net
             if best is None:
@@ -251,6 +302,9 @@ class Agent:
             if j["jid"] == dup["jid"] or j["minute"] > dup["minute"]:
                 continue
             other = self._blob(j, msgs)
+            # never merge into a non-request (we ignore it) or into another repeat
+            if any(p in other for p in NOT_A_JOB) or any(p in other for p in FOLLOW_UP):
+                continue
             if self._customer(other, directory) == who:
                 return j["jid"]
         return None
