@@ -19,7 +19,8 @@ Scheduling (level 2 has twice the work the fleet can do, so saying no is the job
   overtime and, when the fleet is overloaded, the minutes it ties them up); a job that adds
   nothing is refused. Only the head of each route is sent to the game.
 * An unknown P1/P2 site is probed at the zone that minimises the expected detour, and
-  asked about when the answer lands before the technician sets off.
+  asked about when the answer lands before the technician sets off; for a P2 the route
+  planner also weighs asking now and setting off next tick straight to the right site.
 * Repeats are never dispatched; merged only when the original is certain (a merge earns
   nothing, a wrong one costs 15).
 """
@@ -348,6 +349,9 @@ class Agent:
             recallable.append((t["tid"], back))
 
         # ---- full-horizon routes, re-planned from scratch every tick
+        self.next_tick = now + rules["tick"]
+        for p in plans + [b for _, b in recallable]:
+            p["can_ask"] = p["zone"] is None and not asked(p["job"]["jid"], "location")
         recalls = self._insertion(plans, techs, travel, rules, now, recallable)
 
         # ---- an unknown site: ask when the answer lands before the technician sets off (the
@@ -388,24 +392,41 @@ class Agent:
 
     # ------------------------------------------------------------------ route planner
     def _simulate(self, t, seq, travel, rules, lam):
-        """Walk technician t through seq: (objective, [(zone, departs, on_time)])."""
+        """Walk technician t through seq: (objective, [(zone, departs, on_time, mode)]). A job
+        whose site is unknown is either probed now ("go": the expected detour) or asked about
+        and set off for at the next tick straight to the confirmed site ("ask"): whichever
+        adds more."""
         time_, at, total, legs = t["free_at"], t["at"], 0.0, []
         own_end = t["shift_end"] or rules["shift_end"]
         for p in seq:
             zone, drive, delay = self._route(at, p, travel)
-            duration = DURATION_GUESS[p["trade"]]
-            lo, hi = DURATION_SPREAD.get(p["trade"], (duration, duration))
-            arrival = time_ + drive + delay
-            finish = arrival + duration
-            on_time = sum(arrival + d <= p["deadline"] for d in (lo, duration, hi)) / 3.0
-            value = rules["value"].get(p["prio"], 0) * (on_time + (1 - on_time) * rules["late"])
-            if finish > rules["hard_stop"]:
-                value = 0.0
-            overtime = max(0, finish - max(own_end, time_))
-            total += value - rules["travel"] * drive - rules["overtime"] * overtime - lam * (finish - time_)
-            legs.append((zone, time_, on_time))
+            options = [self._leg(p, time_, time_, drive, delay, 0.0, own_end, rules, lam) + (zone, "go")]
+            # a P1 cannot spare the tick an answer takes; a P2 (4 h SLA) often can
+            if p["zone"] is None and p.get("can_ask") and p["prio"] >= 2:
+                start = max(time_, self.next_tick)
+                exp_drive = sum(q * travel.get(at, {}).get(z, 30) for z, q in p["cands"].items())
+                options.append(self._leg(p, time_, start, exp_drive, 0.0, rules["fee"], own_end, rules, lam)
+                               + (zone, "ask"))
+            gain, finish, on_time, departs, zone, mode = max(options, key=lambda o: o[0])
+            total += gain
+            legs.append((zone, departs, on_time, mode))
             time_, at = finish, p["zone"] or zone
         return total, legs
+
+    @staticmethod
+    def _leg(p, free, start, drive, delay, fee, own_end, rules, lam):
+        """(worth, finish, chance on time, departure) of one job set off for at `start`."""
+        duration = DURATION_GUESS[p["trade"]]
+        lo, hi = DURATION_SPREAD.get(p["trade"], (duration, duration))
+        arrival = start + drive + delay
+        finish = arrival + duration
+        on_time = sum(arrival + d <= p["deadline"] for d in (lo, duration, hi)) / 3.0
+        value = rules["value"].get(p["prio"], 0) * (on_time + (1 - on_time) * rules["late"])
+        if finish > rules["hard_stop"]:
+            value = 0.0
+        overtime = max(0, finish - max(own_end, free))
+        worth = value - fee - rules["travel"] * drive - rules["overtime"] * overtime - lam * (finish - free)
+        return worth, finish, on_time, start
 
     def _routes(self, plans, crew, travel, rules, lam):
         """Full-horizon routes: each job goes where it adds the most to the whole plan
@@ -491,9 +512,12 @@ class Agent:
         for t in crew:
             seq = routes[t["tid"]]
             _, legs = self._simulate(t, seq, travel, rules, lam)
-            for k, (p, (zone, departs, on_time)) in enumerate(zip(seq, legs)):
+            sending = True
+            for k, (p, (zone, departs, on_time, mode)) in enumerate(zip(seq, legs)):
                 p["tech"], p["departs"] = t, departs
-                if k < MAX_QUEUE - len(t["queue"]):
+                if mode == "ask":
+                    sending = False               # asked now; the route resumes next tick
+                if sending and k < MAX_QUEUE - len(t["queue"]):
                     t["queue"] = t["queue"] + [(p["job"]["jid"], zone)]
         return recalls
 
