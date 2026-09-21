@@ -336,9 +336,24 @@ class Agent:
         # when there is more of it than the fleet can do.
         self.load = self._load(plans, techs, msgs, now, rules)
 
-        recalls = []
+        # ---- technicians on the road to lower-priority work, who a late P1 may recall
+        recallable = []
+        for t in techs:
+            cur = byid.get(t["job"])
+            if t["activity"] != "travel" or not cur or cur["status"] != "travelling" or t["queue"] \
+                    or t["off_shift"] or not t["dest"] or not t["until"] or cur["jid"] in repeats:
+                continue
+            cblob = self._blob(cur, msgs)
+            cprio = cur["prio"] or self._priority(cblob) or 2
+            if cprio == 1:
+                continue
+            back = self._plan(dict(cur, status="unassigned"), cur["zone"] or t["dest"],
+                              cur["skill"] or self._trade(cblob) or "electrical", cprio, cblob,
+                              directory, sites, rules)
+            recallable.append((t["tid"], back))
+
         # ---- full-horizon routes, re-planned from scratch every tick
-        self._insertion(plans, techs, travel, rules, now)
+        recalls = self._insertion(plans, techs, travel, rules, now, recallable)
 
         # ---- an unknown site: ask when the answer lands before the technician sets off (the
         # game sends them to the confirmed site then), or when nobody can take a P1/P2 yet
@@ -397,11 +412,10 @@ class Agent:
             time_, at = finish, p["zone"] or zone
         return total, legs
 
-    def _insertion(self, plans, techs, travel, rules, now):
+    def _routes(self, plans, crew, travel, rules, lam):
         """Full-horizon routes: each job goes where it adds the most to the whole plan
-        (cheapest insertion, then relocation passes); a job that adds nothing is refused."""
-        lam = self._accept_opp()
-        crew = [t for t in techs if not t["off_shift"] and t["at"] in travel]
+        (cheapest insertion, then relocation passes); a job that adds nothing is refused.
+        Returns ({tid: [plan, ...]}, total value)."""
         routes = {t["tid"]: [] for t in crew}
         value = {t["tid"]: 0.0 for t in crew}
 
@@ -412,49 +426,81 @@ class Agent:
                     continue
                 seq = routes[t["tid"]]
                 for i in range(len(seq) + 1):
-                    cand = seq[:i] + [p] + seq[i:]
-                    v, _ = self._simulate(t, cand, travel, rules, lam)
-                    gain = v - value[t["tid"]]
-                    if best is None or gain > best[0]:
-                        best = (gain, t, i, v)
+                    v, _ = self._simulate(t, seq[:i] + [p] + seq[i:], travel, rules, lam)
+                    if best is None or v - value[t["tid"]] > best[0]:
+                        best = (v - value[t["tid"]], t, i, v)
             return best
 
         order = sorted(plans, key=lambda p: (-rules["value"].get(p["prio"], 0), p["deadline"]))
         for p in order:
             b = best_slot(p)
             if b and b[0] > 0:
-                gain, t, i, v = b
-                routes[t["tid"]].insert(i, p)
-                value[t["tid"]] = v
+                routes[b[1]["tid"]].insert(b[2], p)
+                value[b[1]["tid"]] = b[3]
         for _ in range(INS_PASSES):
             moved = False
             for p in order:
                 home = next((t for t in crew if p in routes[t["tid"]]), None)
                 if home is not None:
-                    seq = routes[home["tid"]]
-                    seq.remove(p)
-                    value[home["tid"]], _ = self._simulate(home, seq, travel, rules, lam)
+                    routes[home["tid"]].remove(p)
+                    value[home["tid"]], _ = self._simulate(home, routes[home["tid"]], travel, rules, lam)
                 b = best_slot(p)
                 if b and b[0] > 0:
-                    gain, t, i, v = b
-                    routes[t["tid"]].insert(i, p)
-                    value[t["tid"]] = v
-                    if t is not home:
-                        moved = True
+                    routes[b[1]["tid"]].insert(b[2], p)
+                    value[b[1]["tid"]] = b[3]
+                    moved = moved or b[1] is not home
                 elif home is not None:
                     moved = True
             if not moved:
                 break
+        return routes, sum(value.values())
+
+    def _insertion(self, plans, techs, travel, rules, now, recallable):
+        """Plan the routes; when a P1 would be refused or late, also try recalling each
+        technician who is on the road to lower-priority work (they still reach that site,
+        the drive is sunk, and the job goes back into the pool). Keep whichever plan is worth
+        more. Returns the unassign commands for the recalls made."""
+        lam = self._accept_opp()
+        crew = [t for t in techs if not t["off_shift"] and t["at"] in travel]
+        routes, total = self._routes(plans, crew, travel, rules, lam)
+        recalls = []
+        planned = {id(p): (t, k) for t in crew for k, p in enumerate(routes[t["tid"]])}
+
+        def late_p1(routes):
+            for t in crew:
+                _, legs = self._simulate(t, routes[t["tid"]], travel, rules, lam)
+                if any(p["prio"] == 1 and leg[2] < 1 for p, leg in zip(routes[t["tid"]], legs)):
+                    return True
+            return any(p["prio"] == 1 and id(p) not in planned for p in plans)
+
+        if recallable and late_p1(routes):
+            best = None
+            for tid, back in recallable:
+                t = next((c for c in crew if c["tid"] == tid), None)
+                if t is None:
+                    continue
+                there = dict(t, free_at=max(now, t["until"]), at=t["dest"])
+                kept, _ = self._simulate(there, [back], travel, rules, lam)   # the job as it goes now
+                alt_crew = [there if c is t else c for c in crew]
+                alt_routes, alt_total = self._routes(plans + [back], alt_crew, travel, rules, lam)
+                gain = alt_total - (total + kept)
+                if gain > 0 and (best is None or gain > best[0]):
+                    best = (gain, t, there, back, alt_crew, alt_routes)
+            if best:
+                _, t, there, back, crew, routes = best
+                t["free_at"], t["at"] = there["free_at"], there["at"]
+                crew = [t if c is there else c for c in crew]
+                plans.append(back)
+                recalls.append("[unassign %s]" % back["job"]["jid"])
         # commit the head of each route; the rest waits for the next tick's re-plan
         for t in crew:
             seq = routes[t["tid"]]
             _, legs = self._simulate(t, seq, travel, rules, lam)
             for k, (p, (zone, departs, on_time)) in enumerate(zip(seq, legs)):
+                p["tech"], p["departs"] = t, departs
                 if k < MAX_QUEUE - len(t["queue"]):
-                    p["tech"], p["departs"] = t, departs
                     t["queue"] = t["queue"] + [(p["job"]["jid"], zone)]
-                else:
-                    p["tech"], p["departs"] = t, departs      # planned, not yet sent
+        return recalls
 
     def _plan(self, j, zone, trade, prio, blob, directory, sites, rules):
         sla = rules["sla"].get(prio)
