@@ -52,8 +52,10 @@ SYSTEM = (
     "nothing else, with exactly these keys: {\"prio\": 1|2|3|null, \"trade\": string|null, "
     "\"zone\": string|null, \"repeat_of\": string|null, \"not_a_job\": true|false, "
     "\"confidence\": 0.0-1.0, \"reason\": \"at most 10 words\"}. "
-    "prio: 1 = emergency (people stuck, goods or patients at risk, business stopped), 2 = should "
-    "be done today, 3 = no rush; a negation counts (\"not critical\" is 3). trade: the trade that "
+    "prio: 1 = emergency (people stuck or in danger, goods or patients at risk, business stopped, "
+    "or the customer wants someone now / ASAP / immediately / before an event today), 2 = should "
+    "be done today, within a few hours, 3 = no rush (\"whenever\", \"by end of day\", \"no hurry\", "
+    "\"not critical\"); a negation counts (\"not critical\" is 3). trade: the trade that "
     "fixes the cause, not the symptom, from the list; a trade the customer says was ruled out "
     "(\"power is fine\") is not it; several systems failing at once is electrical. zone: the zone "
     "of the directory customer who sent it, only if the message names that customer or a nickname; "
@@ -159,8 +161,15 @@ def _safe(text, limit=60):
     return re.sub(r"[^A-Za-z0-9-]+", "_", text or "").strip("_")[:limit] or "-"
 
 
+TRANSIENT = ("budget", "APITimeoutError", "APIConnectionError", "RateLimitError",
+             "InternalServerError", "APIStatusError")
+RETRIES = 2                 # a slow or refused call is tried again on later ticks, this often
+
+
 def encode(jid, v, error=None):
     if v is None:
+        if error in TRANSIENT:
+            return "%s=r:%s" % (jid, _safe(error, 30))          # try again next tick
         return "%s=x:%s" % (jid, _safe(error or "none", 30))   # asked, nothing usable: never again
     return "%s=%s,%s,%s,%s,%d,%d,%s" % (jid, v["prio"] or "-", v["trade"] or "-", v["zone"] or "-",
                                         v["repeat_of"] or "-", int(v["not_a_job"]),
@@ -169,7 +178,7 @@ def encode(jid, v, error=None):
 
 def decode(obs):
     """Every model answer in our earlier replies: {jid: reading or None}."""
-    cache = {}
+    cache, tries = {}, {}
     for line in obs.splitlines():
         if not re.match(r"^\[Player[^\]]*\]", line):
             continue
@@ -178,6 +187,11 @@ def decode(obs):
                 jid, _, v = item.partition("=")
                 if v.startswith("x"):
                     cache[jid] = None
+                    continue
+                if v.startswith("r"):             # transient: asked again until RETRIES are spent
+                    tries[jid] = tries.get(jid, 0) + 1
+                    if tries[jid] >= RETRIES and jid not in cache:
+                        cache[jid] = None
                     continue
                 f = v.split(",")
                 if len(f) < 6:

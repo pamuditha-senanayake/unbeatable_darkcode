@@ -208,7 +208,11 @@ BOARD_HEAD = re.compile(r"=== \d\d:\d\d \| tick \d+/\d+ \|")
 # the message refers to a place ("calling from X", "here at X", "(X)")
 SITE_REF = re.compile(r"\b(calling from|here at|we are at|this is .{2,30} again)\b|\(")
 USE_LLM = True              # SHA D: the LLM reader reads every new ticket. False = rules only (SHA C).
-LLM_PRIMARY = False         # level 4: take the model's reading first, the rules fill its gaps
+LLM_PRIMARY = True          # level 4: take the model's reading first, the rules fill its gaps.
+# Set from the game id in reset(): the regex lists read the hand-written wording of levels
+# 1-3 exactly, so there the model only fills gaps; from level 4 the tickets are paraphrased
+# (a bank the lists never saw) and the model reads first. Unknown level: model first.
+RULES_LEVELS = re.compile(r"L[123](?!\d)")
 LLM_FILL = 0.6              # model confidence needed to fill what the rules left open
 LLM_HIGH = 0.85             # ... to overrule the rules on a high-stakes disagreement
 LLM_SURE = 0.9              # ... to take a site, or to close a ticket as not a job
@@ -220,7 +224,9 @@ class Agent:
         self.started = time.monotonic()
 
     def reset(self, game_id, player_id):
+        global LLM_PRIMARY
         self.game_id = game_id
+        LLM_PRIMARY = not RULES_LEVELS.search(str(game_id or ""))
 
     def __call__(self, observation):
         # Never raise: a raised reply is a fault, and four faults lose the shift.
@@ -491,7 +497,7 @@ class Agent:
         # The replay shows commands, not notes: once per shift, when the reader was switched
         # on but got no answer, send a harmless "[llm <ErrorClass>]" in a spare slot. The game
         # rejects it at no cost (the reply keeps its [wait]) and the replay records why.
-        failed = [n.split("=x:", 1)[1] for n in notes if "=x:" in n]
+        failed = [n.split(":", 1)[1] for n in notes if "=x:" in n or "=r:" in n]
         if USE_LLM and failed and not any(v for v in cache.values()) and len(out) < 5 \
                 and "[llm " not in mine:
             out.insert(len(out) - 1, "[llm %s]" % re.sub(r"[^A-Za-z0-9_]", "", failed[0])[:40])
@@ -541,20 +547,19 @@ class Agent:
         Returns None (not a request) or (zone, trade, prio, asks, hold)."""
         c, jid, extra, hold = llm["confidence"], j["jid"], [], False
         ask = lambda topic: extra.append("[ask %s %s]" % (jid, topic)) if not asked(jid, topic) else None
-        if llm["not_a_job"] and c >= LLM_SURE and trade is None and prio is None:
-            return None
+        if llm["not_a_job"] and c >= LLM_SURE and prio is None and (trade is None or LLM_PRIMARY):
+            return None                           # level 4: a stray trade word in a thank-you note
         # priority: fill a gap at LLM_FILL; overrule only to raise a possible P1 at LLM_HIGH
         if j["prio"] is None and llm["prio"] in (1, 2, 3):
-            if prio is None:
-                if c >= LLM_FILL:
-                    prio = llm["prio"]
-            elif LLM_PRIMARY and (llm["prio"] == 1 or c >= LLM_FILL):
-                # the rules read the wording of levels 1-3 exactly, so a confident model
-                # never overrules them there (measured: it cost 0.07 on a level-2 shift);
-                # only when the model reads first (level 4) does its priority win
+            # Urgency stays rules-first on every level: when a calm/alarm/today phrase matches
+            # it is right even on paraphrased text (12 of 13 on a DeepSeek paraphrase sample),
+            # while the model reads "no rush, but by end of day" as a P2. The model fills the
+            # gaps, which on level 4 are about 40 % of the tickets.
+            if prio is None and c >= LLM_FILL:
                 prio = llm["prio"]
         # trade: fill a gap; never a trade the customer ruled out; overrule the rules only when
-        # they fell back on a ruled-out trade (or when the model reads first, LLM_PRIMARY)
+        # they fell back on a ruled-out trade, or when the model reads first (LLM_PRIMARY,
+        # level 4: on paraphrased text the lists read 20 of 42 trades, the model 41 of 42)
         if j["skill"] is None and llm["trade"]:
             ruled_out = {t for phrase, t in EXONERATE if phrase in blob}
             if llm["trade"] not in ruled_out:
@@ -566,7 +571,7 @@ class Agent:
                     trade = llm["trade"]
         # site: only fill a gap, only a place the message refers to, never a decoy zone
         text = msgs.get(jid, {}).get("text", "").lower()
-        if zone is None and llm["zone"] and c >= LLM_SURE and SITE_REF.search(text) \
+        if zone is None and llm["zone"] and c >= LLM_SURE and (LLM_PRIMARY or SITE_REF.search(text)) \
                 and llm["zone"] in self._zone_odds(trade, blob, directory, sites):
             zone = llm["zone"]
         # a likely repeat the rules missed: never dispatch it before the customer confirms.

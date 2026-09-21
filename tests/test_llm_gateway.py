@@ -227,10 +227,10 @@ class ModelPath(unittest.TestCase):
         a = self.agent("http://127.0.0.1:%d/v1" % port)
         replies, _ = self.shift(a)
         notes = " ".join(replies)
-        self.assertIn("=x:APIConnectionError", notes)
+        self.assertIn("=r:APIConnectionError", notes)
         # the one diagnostic the replay shows, once per shift
         self.assertEqual(notes.count("[llm APIConnectionError]"), 1)
-        self.assertLessEqual(notes.count("=x:"), self.llm_reader.MAX_FAILURES + 3)   # then it stops
+        self.assertLessEqual(notes.count("=r:"), 2 * (self.llm_reader.MAX_FAILURES + 5))   # then it stops
 
     def test_slow_gateway_stays_inside_the_reply_limit(self):
         self.gw = Gateway(lambda path, body: (200, reading(prio=1), 5.0))
@@ -241,7 +241,7 @@ class ModelPath(unittest.TestCase):
         reply = a(obs)
         self.assertLess(time.monotonic() - t0, 3.0)
         self.valid(reply)
-        self.assertRegex(reply, r"J3=x:(budget|APITimeoutError)")
+        self.assertRegex(reply, r"J3=r:(budget|APITimeoutError)")
 
     def test_junk_whole_shift_is_legal(self):
         answers = ["sure! the boiler", "{bad json", reading(prio=7), json.dumps({"prio": 1, "confidence": 0.9,
