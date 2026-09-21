@@ -20,8 +20,13 @@ without any model in the loop. It is the "a careful human would do this" baselin
 It then dispatches by SLA deadline rather than by guessed priority, and refuses work it
 cannot finish before the shift ends, because overtime at 1/min outruns a P3's 10 points.
 """
+import json
+import os
 import random
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
+from typing import Optional
 
 from common import (dd_now, dd_parse_directory, dd_parse_jobs, dd_parse_messages,
                     dd_parse_techs, dd_travel, detect_game)
@@ -134,18 +139,138 @@ def parse_rules(obs):
     return r
 
 
+# ---------------------------------------------------------------------- the model, as a helper
+# The rules read every ticket. The model is asked only when they are unsure, once per ticket,
+# and only fills in what the rules could not read. Anything that goes wrong - no gateway, a
+# timeout, bad JSON, a zone or job id that does not exist - falls back to the rules.
+LLM_MODEL = "arena-small"
+LLM_CALL_TIMEOUT = 20.0     # seconds per call
+LLM_TICK_BUDGET = 30.0      # seconds of model time per reply, all calls together (limit is 45)
+LLM_MAX_TOKENS = 300        # minimal reasoning plus a ~60-token JSON answer
+LLM_FILL = 0.6              # confidence needed to fill a gap the rules left
+LLM_SURE = 0.9              # ... for a zone, or to close a ticket as not a job
+# The model is only asked where the rules found nothing. Where they found two answers (calm
+# and alarm words, two trades) they pick by design, and on the level 1-2 wording they were
+# right every time (0 errors in 50 + 50 shifts): a model there could only cost points.
+LLM_ASK_ON = {"prio", "trade", "site", "repeat"}
+TRADES = ["electrical", "IT", "HVAC", "refrigeration", "lift", "plumbing"]
+# a place is referred to ("calling from the X", "here at X"), but the directory has no match
+SITE_REF = re.compile(r"\b(calling from|here at|we are at|this is .{2,30} again)\b|\(")
+NOTES = re.compile(r"llm((?: J\d+=[^ ;]+)+) ;")
+
+try:
+    from openai import OpenAI
+    from pydantic import BaseModel, ConfigDict, Field
+
+    class Reading(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+        prio: Optional[int] = Field(default=None, ge=1, le=3)
+        trade: Optional[str] = None
+        zone: Optional[str] = None
+        is_repeat_of: Optional[str] = None
+        not_a_job: bool = False
+        confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+except Exception:                                   # no openai / pydantic: rules only
+    OpenAI = None
+
+SYSTEM = (
+    "You read one customer message for a field-service dispatcher. Answer with one JSON object "
+    "and nothing else: {\"prio\": 1|2|3|null, \"trade\": string|null, \"zone\": string|null, "
+    "\"is_repeat_of\": string|null, \"not_a_job\": true|false, \"confidence\": 0.0-1.0}. "
+    "prio: 1 = emergency (people stuck, goods about to be lost, the business stopped), 2 = should "
+    "be done today, 3 = no rush; a negation counts (\"not critical\" is 3). trade: the trade that "
+    "fixes the cause, not the symptom, from the list given. zone: the zone of the directory "
+    "customer the message comes from, only if it names that customer or a nickname or a clear "
+    "paraphrase of one; a place mentioned for another reason (a driver, another branch, the "
+    "caller's own office) is not the site; otherwise null. is_repeat_of: one of the listed open "
+    "jobs if this message follows up on it, otherwise null. not_a_job: true only if no service "
+    "is requested at all. Use null for anything you are unsure of.")
+
+
+def llm_client():
+    """A client for the arena gateway, or None when it is not configured (e.g. a laptop)."""
+    base, key = os.environ.get("ARENA_LLM_BASE_URL"), os.environ.get("ARENA_LLM_API_KEY")
+    if OpenAI is None or not base or not key:
+        return None
+    return OpenAI(base_url=base, api_key=key, timeout=LLM_CALL_TIMEOUT, max_retries=0)
+
+
+def llm_prompt(j, text, directory, trades, zones, same_customer):
+    lines = ["Message %s from %s: \"%s\"" % (j["jid"], j.get("full_sender") or j["sender"], text), "",
+             "Directory (customer | zone | nicknames):"]
+    lines += ["  %s | %s | %s" % (c["name"], c["zone"], ", ".join(c["aliases"])) for c in directory]
+    lines += ["", "Trades: " + ", ".join(trades), "Zones: " + ", ".join(zones)]
+    if same_customer:
+        lines += ["", "Open jobs from the same customer:"]
+        lines += ["  %s: \"%s\"" % (jid, t[:120]) for jid, t in same_customer]
+    return "\n".join(lines)
+
+
+def llm_read(client, prompt):
+    """One call. Returns a validated Reading, or raises."""
+    kwargs = dict(model=LLM_MODEL, messages=[{"role": "system", "content": SYSTEM},
+                                             {"role": "user", "content": prompt}],
+                  reasoning_effort="minimal", max_completion_tokens=LLM_MAX_TOKENS,
+                  response_format={"type": "json_object"}, timeout=LLM_CALL_TIMEOUT)
+    out = client.chat.completions.create(**kwargs)
+    content = (out.choices[0].message.content or "").strip()
+    m = re.search(r"\{.*\}", content, re.S)     # tolerate a stray fence around the object
+    return Reading.model_validate(json.loads(m.group(0) if m else content))
+
+
+def encode_note(jid, r):
+    if r is None:
+        return "%s=x" % jid                         # asked, no usable answer: never ask again
+    return "%s=%s,%s,%s,%s,%d,%d" % (jid, r.prio or "-", r.trade or "-", r.zone or "-",
+                                      r.is_repeat_of or "-", int(r.not_a_job), round(r.confidence * 100))
+
+
+def decode_notes(obs):
+    """Every model answer from our earlier replies (they survive a restart in the history)."""
+    cache = {}
+    for line in obs.splitlines():
+        if not line.startswith("[Player]"):
+            continue
+        for m in NOTES.finditer(line):
+            for item in m.group(1).split():
+                jid, _, v = item.partition("=")
+                if v == "x":
+                    cache[jid] = None
+                    continue
+                f = v.split(",")
+                if len(f) != 6:
+                    continue
+                dash = lambda x: None if x == "-" else x
+                try:
+                    cache[jid] = {"prio": int(f[0]) if f[0] != "-" else None, "trade": dash(f[1]),
+                                  "zone": dash(f[2]), "is_repeat_of": dash(f[3]),
+                                  "not_a_job": f[4] == "1", "confidence": int(f[5]) / 100.0}
+                except ValueError:
+                    continue
+    return cache
+
+
+_POOL = ThreadPoolExecutor(max_workers=4)
+
+
 BOARD_HEAD = re.compile(r"=== \d\d:\d\d \| tick \d+/\d+ \|")
 
 
 class Agent:
     def __init__(self):
         self.rng = random.Random(7)
+        try:
+            self.llm = llm_client()
+        except Exception:
+            self.llm = None
+        self.tick_started = time.monotonic()
 
     def reset(self, game_id, player_id):
         self.game_id = game_id
 
     def __call__(self, observation):
         # Never raise: a raised reply is a fault, and four faults lose the shift.
+        self.tick_started = time.monotonic()
         try:
             observation = observation.replace("\r\n", "\n")
             # the intro may be missing from a cut history; a board header is enough to play
@@ -196,6 +321,113 @@ class Agent:
             return 2
         return None                               # unreadable: ask the customer
 
+    def _doubts(self, j, blob, directory, jobs, msgs, obs):
+        """Why the rules are unsure about this ticket (empty when they are sure)."""
+        why = []
+        if any(p in blob for p in FOLLOW_UP):
+            if not self._original(j, blob, jobs, msgs, directory, obs) \
+                    and self._candidates(j, blob, jobs, msgs, directory):
+                why.append("repeat")
+            return why
+        calm = [p for p in CALM if p in blob]
+        rest = blob
+        for p in calm:                            # "not critical" must not count as alarm
+            rest = rest.replace(p, " ")
+        alarm = [p for p in ALARM if p in rest]
+        if j["prio"] is None:
+            if not calm and not alarm and not any(p in blob for p in TODAY):
+                why.append("prio")
+            elif calm and alarm:
+                why.append("prio-conflict")
+        if j["skill"] is None:
+            ruled_out = {trade for phrase, trade in EXONERATE if phrase in blob}
+            hits = {trade for phrases, trade in RULES if trade not in ruled_out and any(p in blob for p in phrases)}
+            if not hits and not any(any(p in blob for p in phrases) for phrases, _ in RULES):
+                why.append("trade")
+            elif len(hits) > 1:
+                why.append("trade-multi")
+        # "the site isn't in the directory": the message refers to a place the directory cannot
+        # resolve. A message that gives no place at all is left to a probe or an ask; a model
+        # could only guess there.
+        if j["zone"] is None and self._site(blob, directory) is None \
+                and SITE_REF.search(msgs.get(j["jid"], {}).get("text", "").lower()):
+            why.append("site")
+        return why
+
+    # ------------------------------------------------------------------ the model
+    def _consult(self, jobs, msgs, directory, travel, obs, cache):
+        """Ask the model about each new ticket the rules are unsure of, in parallel, within
+        the tick budget. Returns the notes to carry in this reply."""
+        zones = [z for z in travel if z != "Depot"]
+        todo = []
+        for j in jobs:
+            if j["status"] != "unassigned" or j["jid"] in cache:
+                continue
+            blob = self._blob(j, msgs)
+            if any(p in blob for p in NOT_A_JOB) \
+                    or not LLM_ASK_ON & set(self._doubts(j, blob, directory, jobs, msgs, obs)):
+                continue
+            same = [(o["jid"], msgs.get(o["jid"], {}).get("text", ""))
+                    for o in self._candidates(j, blob, jobs, msgs, directory)]
+            m = msgs.get(j["jid"], {})
+            prompt = llm_prompt(dict(j, full_sender=m.get("sender")), m.get("text", ""), directory,
+                                TRADES, zones, same)
+            todo.append((j["jid"], prompt, {jid for jid, _ in same}))
+        remaining = LLM_TICK_BUDGET - (time.monotonic() - self.tick_started)
+        if not todo or remaining < 1.0:
+            return []
+        futures = {_POOL.submit(llm_read, self.llm, prompt): (jid, ids) for jid, prompt, ids in todo}
+        done, _ = wait_futures(futures, timeout=remaining)
+        notes = []
+        for f, (jid, ids) in futures.items():
+            if f not in done and f.cancel():
+                continue                          # never sent: try again next tick
+            r = None
+            if f in done:
+                try:
+                    r = self._checked(f.result(), zones, ids)
+                except Exception:
+                    r = None
+            cache[jid] = None if r is None else {"prio": r.prio, "trade": r.trade, "zone": r.zone,
+                                                 "is_repeat_of": r.is_repeat_of, "not_a_job": r.not_a_job,
+                                                 "confidence": r.confidence}
+            notes.append(encode_note(jid, r))
+        return notes
+
+    @staticmethod
+    def _checked(r, zones, ids):
+        """Drop whatever the game would reject: an unknown trade, a zone off the travel
+        table, a job id that is not one of the customer's open jobs."""
+        by_lower = {z.lower(): z for z in zones}
+        trades = {t.lower(): t for t in TRADES}
+        r.trade = trades.get((r.trade or "").strip().lower())
+        r.zone = by_lower.get((r.zone or "").strip().lower())
+        r.is_repeat_of = (r.is_repeat_of or "").strip().upper() or None
+        if r.is_repeat_of not in ids:
+            r.is_repeat_of = None
+        return r
+
+    def _with_model(self, j, llm, zone, trade, prio, zones, site_ref):
+        """Fill only what the rules left open, never what they read or the game confirmed. A
+        zone is only taken when the message refers to a place: from a message with no place
+        in it a model can only guess, and a decoy ("I am at the Kista office") is an easy guess."""
+        c = llm["confidence"]
+        if j["zone"] is None and zone is None and site_ref and llm["zone"] in zones and c >= LLM_SURE:
+            zone = llm["zone"]
+        if j["skill"] is None and trade is None and llm["trade"] in TRADES and c >= LLM_FILL:
+            trade = llm["trade"]
+        if j["prio"] is None and prio is None and llm["prio"] in (1, 2, 3) and c >= LLM_FILL:
+            prio = llm["prio"]
+        return zone, trade, prio
+
+    def _candidates(self, j, blob, jobs, msgs, directory):
+        """Earlier open jobs from the same customer (what a model may call the original)."""
+        who = self._customer(blob, directory)
+        if who is None:
+            return []
+        return [o for o in jobs if o["jid"] != j["jid"] and o["minute"] <= j["minute"]
+                and self._customer(self._blob(o, msgs), directory) == who]
+
     # ------------------------------------------------------------------ the shift
     def _shift(self, obs):
         jobs = dd_parse_jobs(obs)
@@ -216,17 +448,38 @@ class Agent:
         mine = " ".join(l for l in obs.splitlines() if l.startswith("[Player]"))
         asked = lambda jid, topic: "[ask %s %s]" % (jid, topic) in mine
 
+        cache, notes = {}, []
+        try:
+            cache = decode_notes(obs)
+            # circuit breaker: three failed calls and not one answer means the gateway is down
+            # or hanging; stop spending up to 30 s a tick on it for the rest of the shift
+            failed = sum(1 for v in cache.values() if v is None)
+            if self.llm is not None and not (failed >= 3 and len(cache) == failed):
+                notes = self._consult(jobs, msgs, directory, travel, obs, cache)
+        except Exception:
+            pass
+        zones = [z for z in travel if z != "Depot"]
+        open_ids = {j["jid"] for j in jobs}
+
         closes, merges, asks, plans, probes = [], [], [], [], []
         for j in jobs:
             if j["status"] != "unassigned":
                 continue
             blob = self._blob(j, msgs)
+            llm = cache.get(j["jid"])
 
             if any(p in blob for p in NOT_A_JOB):
                 closes.append("[ignore %s]" % j["jid"])
                 continue
+            if llm and llm["not_a_job"] and llm["confidence"] >= LLM_SURE \
+                    and self._trade(blob) is None and self._priority(blob) is None:
+                closes.append("[ignore %s]" % j["jid"])  # the rules could read nothing either
+                continue
             if any(p in blob for p in FOLLOW_UP):
                 orig = self._original(j, blob, jobs, msgs, directory, obs)
+                if not orig and llm and llm["is_repeat_of"] in open_ids and llm["confidence"] >= LLM_FILL \
+                        and llm["is_repeat_of"] != j["jid"]:
+                    orig = llm["is_repeat_of"]
                 if orig:
                     merges.append("[merge %s %s]" % (j["jid"], orig))
                     continue
@@ -243,6 +496,9 @@ class Agent:
             zone = j["zone"] or self._site(blob, directory)
             trade = j["skill"] or self._trade(blob)
             prio = j["prio"] or self._priority(blob)
+            if llm:
+                site_ref = bool(SITE_REF.search(msgs.get(j["jid"], {}).get("text", "").lower()))
+                zone, trade, prio = self._with_model(j, llm, zone, trade, prio, zones, site_ref)
             # Ask about whatever the text does not tell us, all in the same tick. Once an
             # answer is in, the game shows it on the row; if it is still pending, hold the job.
             if zone is None and trade and prio in (1, 2) and not asked(j["jid"], "location"):
@@ -372,7 +628,9 @@ class Agent:
             t["queue"] = [jid for jid, _ in want]
 
         cmds = closes + merges + assigns + asks
-        return " ".join(cmds[:4] + ["[wait]"])
+        # model answers ride along outside the brackets, so a restarted agent still has them
+        head = ["llm " + " ".join(notes) + " ;"] if notes else []
+        return " ".join(head + cmds[:4] + ["[wait]"])
 
     def _blob(self, j, msgs):
         """Sender and text, lower-cased. The job row cuts the sender at 28 characters, so

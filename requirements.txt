@@ -17,3 +17,5 @@
 # Do NOT put harness/codefest_arena-1.0.0-py3-none-any.whl here. That wheel is for your
 # laptop only. Your competition container has the agent wrapper and approved agent helpers,
 # not arena, TextArena, game source, or other teams' files.
+openai==3.14.1
+pydantic==2.13.5
