@@ -28,6 +28,7 @@ Layers: this file is the general core; llm_reader.py reads every new ticket once
 arena-small (combined with the regex reader in `_combine`); handlers.py holds the edge-case
 handlers; guards.py filters every reply to legal commands.
 """
+import os as _os
 import random
 import re
 import sys
@@ -183,7 +184,7 @@ def parse_rules(obs):
 BOARD_HEAD = re.compile(r"=== \d\d:\d\d \| tick \d+/\d+ \|")
 # the message refers to a place ("calling from X", "here at X", "(X)")
 SITE_REF = re.compile(r"\b(calling from|here at|we are at|this is .{2,30} again)\b|\(")
-USE_LLM = True              # SHA B: the LLM reader (llm_reader.py) reads every new ticket. False = rules only.
+USE_LLM = False             # rules only (SHA C). True = the LLM reader reads every new ticket.
 LLM_PRIMARY = False         # level 4: take the model's reading first, the rules fill its gaps
 LLM_FILL = 0.6              # model confidence needed to fill what the rules left open
 LLM_HIGH = 0.85             # ... to overrule the rules on a high-stakes disagreement
@@ -428,8 +429,9 @@ class Agent:
         # ---- send only the differences. Re-assigning a queued job moves it to the back of the
         # named queue, so everything after the first change in a queue is re-sent in order.
         prio_of = {p["job"]["jid"]: p["prio"] for p in plans}
+        departs_of = {p["job"]["jid"]: p.get("departs", now) for p in plans}
         planned = {jid for t in techs for jid, _ in t["queue"]}
-        urgent, later = [], []
+        ranked = [((1, -1, 0), c) for c in recalls]
         for t in techs:
             want = t["queue"]
             have = current[t["tid"]]
@@ -439,15 +441,21 @@ class Agent:
             cmds = ["[unassign %s]" % jid for jid in have[k:] if jid in replannable and jid not in planned]
             cmds += ["[assign %s %s %s]" % (t["tid"], jid, zone) for jid, zone in want[k:] if zone]
             if cmds:
-                top = min([prio_of.get(jid, 3) for jid, _ in want[k:]] + [3])
-                (urgent if top <= 2 else later).append((top, cmds))
+                changed = [jid for jid, _ in want[k:]]
+                top = min([prio_of.get(jid, 3) for jid in changed] + [3])
+                soon = min([departs_of.get(jid, now) for jid in changed] + [shift_end])
+                # a dispatch the technician acts on before the next tick is worth its slot now;
+                # a second job in a busy queue can wait a tick behind the questions
+                key = (top, 0 if soon < now + rules["tick"] else 2, soon)
+                ranked += [(key, c) for c in cmds]
             t["queue"] = [jid for jid, _ in want]
-        urgent = recalls + [c for _, cs in sorted(urgent, key=lambda x: x[0]) for c in cs]
-        later = [c for _, cs in later for c in cs]
-
-        # P1/P2 dispatches first, then questions, then P3 dispatches; closing repeats and
-        # non-requests costs nothing to put off a tick. At most four, and always [wait].
-        cmds = urgent + asks + asks_p3 + later + merges + closes
+        for c in asks + asks_p3:
+            jid = c.split()[1]
+            ranked.append(((prio_of.get(jid, 3), 1, 0), c))
+        ranked += [((8, 0, 0), c) for c in merges] + [((9, 0, 0), c) for c in closes]
+        # the reply carries four commands: P1 work first, then P1 questions, P2 work, P2
+        # questions, P3 work; merges and ignores earn nothing and wait for a free slot
+        cmds = [c for _, c in sorted(ranked, key=lambda x: x[0])]
         # model answers ride along outside the brackets, so a restarted agent still has them
         head = ["llm " + " ".join(notes) + " ;"] if notes else []
         return " ".join(head + guards.legal(cmds, jobs, techs, travel, asked_any))
