@@ -248,6 +248,17 @@ class Agent:
                 probes.append({"job": j, "trade": trade, "prio": prio,
                                "deadline": shift_end if sla is None else min(j["minute"] + sla, shift_end)})
                 continue
+            # An ask only pays when the job is worth more than the fees plus the drive it will
+            # cost. For a P3 (10) with an unknown site, 5 + an average drive usually is not.
+            need = [t for v, t in ((zone, "location"), (trade, "problem"), (prio, "urgency"))
+                    if v is None and not asked(j["jid"], t)]
+            if need and prio is not None and travel:
+                crew = [t for t in techs if not t["off_shift"] and (trade is None or trade in t["skills"])]
+                sites = [z for z in travel if z != "Depot"] or list(travel)
+                drive = (sum(min(travel.get(t["at"], {}).get(z, 30) for t in crew) for z in sites) / len(sites)
+                         if zone is None and crew else 0)
+                if rules["value"].get(prio, 0) - rules["fee"] * len(need) - rules["travel"] * drive <= 0:
+                    continue
             for value, topic in ((zone, "location"), (trade, "problem"), (prio, "urgency")):
                 if value is None:
                     if not asked(j["jid"], topic):
