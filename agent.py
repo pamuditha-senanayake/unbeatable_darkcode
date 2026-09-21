@@ -23,12 +23,22 @@ Scheduling (level 2 has twice the work the fleet can do, so saying no is the job
   planner also weighs asking now and setting off next tick straight to the right site.
 * Repeats are never dispatched; merged only when the original is certain (a merge earns
   nothing, a wrong one costs 15).
+
+Layers: this file is the general core; llm_reader.py reads every new ticket once with
+arena-small (combined with the regex reader in `_combine`); handlers.py holds the edge-case
+handlers; guards.py filters every reply to legal commands.
 """
 import random
 import re
+import sys
+import time
 
 import guards
 import handlers
+try:
+    import llm_reader
+except Exception:                                   # no helper file or no pydantic: rules only
+    llm_reader = None
 from common import (dd_now, dd_parse_directory, dd_parse_jobs, dd_parse_messages,
                     dd_parse_techs, dd_travel, detect_game)
 
@@ -167,17 +177,24 @@ def parse_rules(obs):
 
 
 BOARD_HEAD = re.compile(r"=== \d\d:\d\d \| tick \d+/\d+ \|")
+# the message refers to a place ("calling from X", "here at X", "(X)")
+SITE_REF = re.compile(r"\b(calling from|here at|we are at|this is .{2,30} again)\b|\(")
+LLM_FILL = 0.6              # model confidence needed to fill what the rules left open
+LLM_HIGH = 0.85             # ... to overrule the rules on a high-stakes disagreement
+LLM_SURE = 0.9              # ... to take a site, or to close a ticket as not a job
 
 
 class Agent:
     def __init__(self):
         self.rng = random.Random(7)
+        self.started = time.monotonic()
 
     def reset(self, game_id, player_id):
         self.game_id = game_id
 
     def __call__(self, observation):
         # Never raise: a raised reply is a fault, and four faults lose the shift.
+        self.started = time.monotonic()
         try:
             observation = observation.replace("\r\n", "\n")
             # the intro may be missing from a cut history; a board header is enough to play
@@ -239,6 +256,9 @@ class Agent:
         rules = parse_rules(obs)
         shift_end = rules["shift_end"]
         byid = {j["jid"]: j for j in jobs}
+        self._obs_cache = llm_reader.decode(obs) if llm_reader else {}
+        # tickets the customer confirmed are a repeat of an earlier one: never dispatched
+        same_issue = set(re.findall(r"about (j\d+) \(problem\): \"yes - this is the same issue", obs.lower()))
         # customer sites: a job whose site is unknown is at one of these, never at the depot
         sites = sorted({c["zone"] for c in directory if c["zone"] in travel}) \
             or [z for z in travel if z != "Depot"] or list(travel)
@@ -276,14 +296,33 @@ class Agent:
                     and not asked(j["jid"], "problem"):
                 asks_p3.append("[ask %s problem]" % j["jid"])   # unclear which job it follows: ask once
 
+        # ---- the LLM reader: once per new ticket, answers carried in the reply notes
+        cache, notes = {}, []
+        try:
+            cache, notes = self._consult(jobs, msgs, directory, techs, sites)
+        except Exception as e:
+            print("agent: LLM reader skipped: %s: %s" % (type(e).__name__, e), file=sys.stderr)
+
         # ---- read every real job still waiting for a technician
         for j in jobs:
             if j["status"] != "unassigned" or j["jid"] in repeats:
+                continue
+            if j["jid"].lower() in same_issue:
                 continue
             blob = self._blob(j, msgs)
             zone = j["zone"] or self._site(blob, directory) or hints.get(j["jid"])
             trade = j["skill"] or self._trade(blob)
             prio = j["prio"] or self._priority(blob)
+            llm = cache.get(j["jid"])
+            if llm:
+                verdict = self._combine(j, blob, zone, trade, prio, llm, directory, sites, msgs, asked)
+                if verdict is None:
+                    closes.append("[ignore %s]" % j["jid"])     # neither reader sees a request
+                    continue
+                zone, trade, prio, extra, hold = verdict
+                asks.extend(extra)
+                if hold:
+                    continue
             # Unreadable trade or urgency: ask, and hold the job until the answer is in; after
             # it, fall back to defaults. An unknown site is not held: it is probed (below).
             need = [t for v, t in ((trade, "problem"), (prio, "urgency")) if v is None and not asked(j["jid"], t)]
@@ -389,7 +428,81 @@ class Agent:
         # P1/P2 dispatches first, then questions, then P3 dispatches; closing repeats and
         # non-requests costs nothing to put off a tick. At most four, and always [wait].
         cmds = urgent + asks + asks_p3 + later + merges + closes
-        return " ".join(guards.legal(cmds, jobs, techs, travel))
+        # model answers ride along outside the brackets, so a restarted agent still has them
+        head = ["llm " + " ".join(notes) + " ;"] if notes else []
+        return " ".join(head + guards.legal(cmds, jobs, techs, travel))
+
+    # ------------------------------------------------------------------ the LLM reader
+    def _consult(self, jobs, msgs, directory, techs, sites):
+        """Ask the model about every ticket it has not read yet (once per ticket), in
+        parallel, within the tick budget. Returns ({jid: reading}, notes for this reply)."""
+        if llm_reader is None or not llm_reader.configured():
+            return {}, []
+        obs_cache = self._obs_cache
+        if not llm_reader.healthy(obs_cache):
+            return obs_cache, []
+        trades = sorted({s for t in techs for s in t["skills"]})
+        todo = []
+        for j in jobs:
+            if j["status"] != "unassigned" or j["jid"] in obs_cache:
+                continue
+            m = msgs.get(j["jid"], {})
+            blob = self._blob(j, msgs)
+            who = self._customer(blob, directory)
+            same = [(o["jid"], msgs.get(o["jid"], {}).get("text", "")) for o in jobs
+                    if o["jid"] != j["jid"] and o["minute"] <= j["minute"] and who is not None
+                    and self._customer(self._blob(o, msgs), directory) == who]
+            todo.append((j["jid"], llm_reader.prompt(j["jid"], m.get("sender", j["sender"]), m.get("text", ""),
+                                                     directory, trades, sites, same),
+                         {jid for jid, _ in same}))
+        todo = todo[:max(0, llm_reader.MAX_CALLS - len(obs_cache))]
+        got, notes = llm_reader.consult(todo, trades, sites, self.started)
+        cache = dict(obs_cache)
+        cache.update(got)
+        return cache, notes
+
+    def _combine(self, j, blob, zone, trade, prio, llm, directory, sites, msgs, asked):
+        """Merge the model's reading with the regex reader's. Where both agree, act. Where
+        one is silent, the other fills in (the model only when confident). Where they
+        disagree on something high-stakes - a possible P1, or a trade the customer ruled out
+        - a confident model wins; any other disagreement is asked about (acting on the
+        rules meanwhile). What the game confirmed is never overruled.
+        Returns None (not a request) or (zone, trade, prio, asks, hold)."""
+        c, jid, extra, hold = llm["confidence"], j["jid"], [], False
+        ask = lambda topic: extra.append("[ask %s %s]" % (jid, topic)) if not asked(jid, topic) else None
+        if llm["not_a_job"] and c >= LLM_SURE and trade is None and prio is None:
+            return None
+        # priority
+        if j["prio"] is None and llm["prio"] in (1, 2, 3):
+            if prio is None:
+                if c >= LLM_FILL:
+                    prio = llm["prio"]
+            elif llm["prio"] != prio:
+                if 1 in (prio, llm["prio"]) and c >= LLM_HIGH:
+                    prio = llm["prio"]
+                else:
+                    ask("urgency")
+        # trade
+        if j["skill"] is None and llm["trade"]:
+            ruled_out = {t for phrase, t in EXONERATE if phrase in blob}
+            if trade is None:
+                if c >= LLM_FILL and llm["trade"] not in ruled_out:
+                    trade = llm["trade"]
+            elif llm["trade"] != trade and llm["trade"] not in ruled_out:
+                if trade in ruled_out and c >= LLM_HIGH:
+                    trade = llm["trade"]           # the rules fell back on a ruled-out trade
+                else:
+                    ask("problem")
+        # site: only fill a gap, only a place the message refers to, never a decoy zone
+        text = msgs.get(jid, {}).get("text", "").lower()
+        if zone is None and llm["zone"] and c >= LLM_SURE and SITE_REF.search(text) \
+                and llm["zone"] in self._zone_odds(trade, blob, directory, sites):
+            zone = llm["zone"]
+        # a likely repeat the rules missed: never dispatch it before the customer confirms
+        if llm["repeat_of"] and c >= LLM_HIGH and not asked(jid, "problem"):
+            ask("problem")
+            hold = True
+        return zone, trade, prio, extra, hold
 
     # ------------------------------------------------------------------ route planner
     def _simulate(self, t, seq, travel, rules, lam):
