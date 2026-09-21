@@ -226,6 +226,8 @@ class ModelPath(unittest.TestCase):
         replies, _ = self.shift(a)
         notes = " ".join(replies)
         self.assertIn("=x:APIConnectionError", notes)
+        # the one diagnostic the replay shows, once per shift
+        self.assertEqual(notes.count("[llm APIConnectionError]"), 1)
         self.assertLessEqual(notes.count("=x:"), self.llm_reader.MAX_FAILURES + 3)   # then it stops
 
     def test_slow_gateway_stays_inside_the_reply_limit(self):

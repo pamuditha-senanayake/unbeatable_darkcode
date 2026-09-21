@@ -38,8 +38,11 @@ import guards
 import handlers
 try:
     import llm_reader
-except Exception:                                   # no helper file or no pydantic: rules only
+    LLM_IMPORT_ERROR = None
+except Exception as _e:                             # reported below, never silent
     llm_reader = None
+    LLM_IMPORT_ERROR = type(_e).__name__
+    print("agent: llm_reader import failed: %s: %s" % (type(_e).__name__, _e), file=sys.stderr)
 from common import (dd_now, dd_parse_directory, dd_parse_jobs, dd_parse_messages,
                     dd_parse_techs, dd_travel, detect_game)
 
@@ -184,7 +187,7 @@ def parse_rules(obs):
 BOARD_HEAD = re.compile(r"=== \d\d:\d\d \| tick \d+/\d+ \|")
 # the message refers to a place ("calling from X", "here at X", "(X)")
 SITE_REF = re.compile(r"\b(calling from|here at|we are at|this is .{2,30} again)\b|\(")
-USE_LLM = False             # rules only (SHA C). True = the LLM reader reads every new ticket.
+USE_LLM = True              # SHA D: the LLM reader reads every new ticket. False = rules only (SHA C).
 LLM_PRIMARY = False         # level 4: take the model's reading first, the rules fill its gaps
 LLM_FILL = 0.6              # model confidence needed to fill what the rules left open
 LLM_HIGH = 0.85             # ... to overrule the rules on a high-stakes disagreement
@@ -458,13 +461,25 @@ class Agent:
         cmds = [c for _, c in sorted(ranked, key=lambda x: x[0])]
         # model answers ride along outside the brackets, so a restarted agent still has them
         head = ["llm " + " ".join(notes) + " ;"] if notes else []
-        return " ".join(head + guards.legal(cmds, jobs, techs, travel, asked_any))
+        out = guards.legal(cmds, jobs, techs, travel, asked_any)
+        # The replay shows commands, not notes: once per shift, when the reader was switched
+        # on but got no answer, send a harmless "[llm <ErrorClass>]" in a spare slot. The game
+        # rejects it at no cost (the reply keeps its [wait]) and the replay records why.
+        failed = [n.split("=x:", 1)[1] for n in notes if "=x:" in n]
+        if USE_LLM and failed and not any(v for v in cache.values()) and len(out) < 5 \
+                and "[llm " not in mine:
+            out.insert(len(out) - 1, "[llm %s]" % re.sub(r"[^A-Za-z0-9_]", "", failed[0])[:40])
+        return " ".join(head + out)
 
     # ------------------------------------------------------------------ the LLM reader
     def _consult(self, jobs, msgs, directory, techs, sites):
         """Ask the model about every ticket it has not read yet (once per ticket), in
         parallel, within the tick budget. Returns ({jid: reading}, notes for this reply)."""
-        if not USE_LLM or llm_reader is None or not llm_reader.configured():
+        if not USE_LLM:
+            return {}, []
+        if llm_reader is None:
+            return {}, (["J0=x:import_" + LLM_IMPORT_ERROR] if LLM_IMPORT_ERROR else [])
+        if not llm_reader.configured():
             return {}, []
         obs_cache = self._obs_cache
         if not llm_reader.healthy(obs_cache):
