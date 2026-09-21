@@ -23,8 +23,8 @@ def legal(*cmds):
 
 class Guards(unittest.TestCase):
     def test_always_ends_in_wait_with_at_most_four(self):
-        out = legal("[ask J1 location]", "[ask J5 location]", "[ask J1 urgency]", "[ask J5 urgency]",
-                    "[ask J1 problem]")
+        out = legal("[ask J1 location]", "[ask J5 location]", "[assign T1 J1 Kista]", "[assign T1 J5 Solna]",
+                    "[unassign J2]")
         self.assertEqual(out[-1], "[wait]")
         self.assertEqual(len(out), 5)
         self.assertEqual(legal(), ["[wait]"])
@@ -57,6 +57,15 @@ class Guards(unittest.TestCase):
     def test_unknown_question_and_duplicates_are_dropped(self):
         self.assertEqual(legal("[ask J1 colour]", "[ask J1 location]", "[ask J1 location]"),
                          ["[ask J1 location]", "[wait]"])
+
+    def test_one_question_per_job_per_shift(self):
+        self.assertEqual(legal("[ask J1 location]", "[ask J1 urgency]"), ["[ask J1 location]", "[wait]"])
+        self.assertEqual(guards.legal(["[ask J1 urgency]", "[ask J5 urgency]"], JOBS, TECHS, ZONES, {"J1"}),
+                         ["[ask J5 urgency]", "[wait]"])
+
+    def test_known_site_is_never_overridden(self):
+        self.assertEqual(legal("[assign T1 J2 Solna]"), ["[wait]"])
+        self.assertEqual(legal("[assign T1 J2 Kista]"), ["[assign T1 J2 Kista]", "[wait]"])
 
 
 if __name__ == "__main__":

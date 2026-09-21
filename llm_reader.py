@@ -161,7 +161,7 @@ def decode(obs):
     """Every model answer in our earlier replies: {jid: reading or None}."""
     cache = {}
     for line in obs.splitlines():
-        if not line.startswith("[Player]"):
+        if not re.match(r"^\[Player[^\]]*\]", line):
             continue
         for m in NOTES.finditer(line):
             for item in m.group(1).split():

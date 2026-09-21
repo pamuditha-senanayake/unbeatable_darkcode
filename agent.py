@@ -105,6 +105,10 @@ MAX_QUEUE = 2                   # jobs sent to a technician's queue; the rest of
 OPP = 0.2
 LOAD_LO, LOAD_HI = 0.6, 1.0
 INS_PASSES = 2                  # relocation passes over the routes
+LIGHT_AFTER = 12.0              # seconds into a reply: skip the relocation passes and recalls
+FALLBACK_AFTER = 30.0           # ... : send the plain earliest-deadline plan instead
+# our own replies echoed in the history ("[Player] ..." or "[Player 0] ...")
+PLAYER_LINE = re.compile(r"^\[Player[^\]]*\]")
 LOAD_UNTIL = 360                # tickets stopped arriving around 14:00 on the practice shifts
 WRONG_SITE_MIN = 15             # a visit to the wrong site costs the technician 15 minutes
 # How often each trade came from each zone over practice shifts 1-50 (levels 1 and 2, the
@@ -179,6 +183,7 @@ def parse_rules(obs):
 BOARD_HEAD = re.compile(r"=== \d\d:\d\d \| tick \d+/\d+ \|")
 # the message refers to a place ("calling from X", "here at X", "(X)")
 SITE_REF = re.compile(r"\b(calling from|here at|we are at|this is .{2,30} again)\b|\(")
+USE_LLM = False             # SHA A: rules only. The LLM reader (llm_reader.py) is switched on in SHA B.
 LLM_FILL = 0.6              # model confidence needed to fill what the rules left open
 LLM_HIGH = 0.85             # ... to overrule the rules on a high-stakes disagreement
 LLM_SURE = 0.9              # ... to take a site, or to close a ticket as not a job
@@ -265,8 +270,9 @@ class Agent:
 
         # Only our own replies count as "asked": the rules text and the board footer both
         # print example asks ("[ask J7 location]", "[ask J4 location]").
-        mine = " ".join(l for l in obs.splitlines() if l.startswith("[Player]"))
+        mine = " ".join(l for l in obs.splitlines() if PLAYER_LINE.match(l))
         asked = lambda jid, topic: "[ask %s %s]" % (jid, topic) in mine
+        asked_any = set(re.findall(r"\[ask (J\d+) ", mine))
 
         # ---- repeats first: they can tell us where an anonymous original is
         closes, merges, asks, asks_p3, plans = [], [], [], [], []
@@ -386,7 +392,20 @@ class Agent:
             back = self._plan(dict(cur, status="unassigned"), cur["zone"] or t["dest"],
                               cur["skill"] or self._trade(cblob) or "electrical", cprio, cblob,
                               directory, sites, rules)
-            recallable.append((t["tid"], back))
+            recallable.append((t["tid"], back, cprio, max(0, t["until"] - now)))
+        # each candidate re-plans the whole board: keep the three most worth recalling
+        recallable = [(tid, back) for tid, back, _, _ in
+                      sorted(recallable, key=lambda r: (-r[2], -r[3]))[:3]]
+
+        # ---- time guard: a cluster pod is slower than a laptop and the reply limit is 45 s
+        elapsed = time.monotonic() - self.started
+        if elapsed > FALLBACK_AFTER:
+            cmds = self._greedy(plans, techs, travel)
+            head = ["llm " + " ".join(notes) + " ;"] if notes else []
+            return " ".join(head + guards.legal(closes + cmds, jobs, techs, travel, asked_any))
+        self.passes = 0 if elapsed > LIGHT_AFTER else INS_PASSES
+        if elapsed > LIGHT_AFTER:
+            recallable = []
 
         # ---- full-horizon routes, re-planned from scratch every tick
         self.next_tick = now + rules["tick"]
@@ -430,13 +449,13 @@ class Agent:
         cmds = urgent + asks + asks_p3 + later + merges + closes
         # model answers ride along outside the brackets, so a restarted agent still has them
         head = ["llm " + " ".join(notes) + " ;"] if notes else []
-        return " ".join(head + guards.legal(cmds, jobs, techs, travel))
+        return " ".join(head + guards.legal(cmds, jobs, techs, travel, asked_any))
 
     # ------------------------------------------------------------------ the LLM reader
     def _consult(self, jobs, msgs, directory, techs, sites):
         """Ask the model about every ticket it has not read yet (once per ticket), in
         parallel, within the tick budget. Returns ({jid: reading}, notes for this reply)."""
-        if llm_reader is None or not llm_reader.configured():
+        if not USE_LLM or llm_reader is None or not llm_reader.configured():
             return {}, []
         obs_cache = self._obs_cache
         if not llm_reader.healthy(obs_cache):
@@ -567,7 +586,7 @@ class Agent:
             if b and b[0] > 0:
                 routes[b[1]["tid"]].insert(b[2], p)
                 value[b[1]["tid"]] = b[3]
-        for _ in range(INS_PASSES):
+        for _ in range(getattr(self, "passes", INS_PASSES)):
             moved = False
             for p in order:
                 home = next((t for t in crew if p in routes[t["tid"]]), None)
@@ -584,6 +603,21 @@ class Agent:
             if not moved:
                 break
         return routes, sum(value.values())
+
+    def _greedy(self, plans, techs, travel):
+        """The fallback when time is short: earliest deadline first, each job to the idle
+        technician with the skill who is closest, one job each."""
+        cmds, busy = [], set()
+        for p in sorted(plans, key=lambda p: (p["deadline"], p["prio"])):
+            if p["zone"] is None or p["job"]["status"] != "unassigned":
+                continue
+            free = [t for t in techs if p["trade"] in t["skills"] and not t["off_shift"]
+                    and not t["queue"] and t["tid"] not in busy and t["at"] in travel]
+            if free:
+                t = min(free, key=lambda t: travel[t["at"]].get(p["zone"], 99))
+                busy.add(t["tid"])
+                cmds.append("[assign %s %s %s]" % (t["tid"], p["job"]["jid"], p["zone"]))
+        return cmds
 
     def _insertion(self, plans, techs, travel, rules, now, recallable):
         """Plan the routes; when a job would be refused or late, also try recalling each
