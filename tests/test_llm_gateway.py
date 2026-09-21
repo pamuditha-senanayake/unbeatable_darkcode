@@ -150,9 +150,9 @@ class ModelPath(unittest.TestCase):
         asked = [re.search(r"Message (J\d+) ", b["messages"][1]["content"]).group(1) for b in self.gw.requests]
         self.assertEqual(len(asked), len(set(asked)), "each ticket is read once")
         body = self.gw.requests[0]
-        self.assertEqual(body["model"], "arena-small")
+        self.assertEqual(body["model"], "arena-medium")
         self.assertEqual(body["reasoning_effort"], "minimal")
-        self.assertLessEqual(body["max_completion_tokens"], 400)
+        self.assertLessEqual(body["max_completion_tokens"], 600)
         self.assertEqual(body["response_format"], {"type": "json_object"})
         self.assertTrue(any("llm J" in r for r in replies))
         print("\n  full shift: %d requests, score %.3f" % (len(self.gw.requests), score))
@@ -166,6 +166,35 @@ class ModelPath(unittest.TestCase):
         self.valid(reply)
         self.assertIn("/v1/chat/completions", self.gw.paths)
         self.assertIn("J3=1,plumbing", reply)
+
+    def test_deepseek_style_gateway_steps_down_the_ladder(self):
+        # refuses reasoning_effort (as DeepSeek does); accepts max_tokens and JSON mode
+        self.gw = Gateway(lambda path, body: (400, "unknown parameter reasoning_effort", 0)
+                          if "reasoning_effort" in body else (200, reading(prio=1, trade="plumbing"), 0))
+        a = self.agent(self.gw.url)
+        _, obs = board()
+        reply = a(obs)
+        self.valid(reply)
+        self.assertIn("J3=1,plumbing", reply)
+        ok = [b for b in self.gw.requests if "reasoning_effort" not in b]
+        self.assertTrue(ok and "max_tokens" in ok[0] and "response_format" in ok[0])
+
+    def test_full_level3_shift_makes_requests(self):
+        sys.path.insert(0, os.path.join(ROOT, "tests"))
+        import l3_shadow
+        l3_shadow.register()
+        self.gw = Gateway(lambda path, body: (200, reading(), 0))
+        a = self.agent(self.gw.url)
+        env, _ = make_env("DispatchDesk-L3")
+        env.reset(num_players=1, seed=7)
+        done = False
+        while not done:
+            _, obs = env.get_observation()
+            r = a(obs)
+            self.valid(r)
+            done, _ = env.step(r)
+        self.assertGreater(len(self.gw.requests), 40)
+        print("\n  full L3 shift: %d requests" % len(self.gw.requests))
 
     def test_refused_parameter_is_retried_without_it(self):
         self.gw = Gateway(lambda path, body: (400, "response_format not supported", 0)
@@ -252,9 +281,10 @@ class ModelPath(unittest.TestCase):
         self.assertNotIn("[ask J3 urgency]", reply)
         self.assertNotIn("[ask J3 problem]", reply)
 
-    def test_possible_p1_disagreement_confident_model_wins_else_ask(self):
-        # seed 4's J1 reads as P3 ("no rush"); the model says P1
-        for conf, expect_ask in ((0.95, False), (0.5, True)):
+    def test_possible_p1_disagreement_is_never_asked_about(self):
+        # seed 4's J1 reads as P3 ("no rush"); the model says P1: a confident model raises it,
+        # an unsure one is ignored, and neither costs a question
+        for conf, expect_ask in ((0.95, False), (0.5, False)):
             if self.gw:
                 self.gw.close()
             self.gw = Gateway(lambda path, body, c=conf: (200, reading(prio=1, trade="plumbing", confidence=c), 0))

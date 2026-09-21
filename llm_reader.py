@@ -17,13 +17,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 from typing import Optional
 
-MODEL = "arena-small"
+MODEL = os.environ.get("DD_LLM_MODEL", "arena-medium")   # the cluster default; DD_LLM_MODEL locally
 EFFORT = "minimal"
-CALL_TIMEOUT = 20.0         # seconds per call
-TICK_BUDGET = 30.0          # seconds of model time per reply, counted from the reply's start
-MAX_TOKENS = 300            # minimal reasoning plus a ~70-token JSON answer
+CALL_TIMEOUT = 12.0         # seconds per call
+TICK_BUDGET = 15.0          # seconds of model time per reply, counted from the reply's start
+MAX_TOKENS = 600            # minimal reasoning plus a ~70-token JSON answer
 MAX_FAILURES = 3            # failed calls with not one answer: the gateway is down, stop asking
-MAX_CALLS = 40              # per shift, whatever happens (level 2 has ~28 tickets)
+MAX_CALLS = 80              # per shift, whatever happens (level 3 has ~57 tickets)
 
 try:
     from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -64,7 +64,7 @@ SYSTEM = (
 
 NOTES = re.compile(r"llm((?: J\d+=[^ ;\[\]]+)+) ;")
 
-_state = {"client": None, "key": None, "suffix": "", "plain": False}
+_state = {"client": None, "key": None, "suffix": "", "level": 0}
 
 
 def configured():
@@ -96,35 +96,45 @@ def prompt(jid, sender, text, directory, trades, zones, same_customer):
     return "\n".join(lines)
 
 
-def _create(cl, user_prompt):
+def _create(cl, user_prompt, level):
+    """The request at compatibility level 0 (the arena gateway: reasoning_effort,
+    max_completion_tokens, JSON mode), 1 (no reasoning_effort, max_tokens: DeepSeek and
+    other plain OpenAI-compatible servers) or 2 (also no JSON mode)."""
     kwargs = dict(model=MODEL, messages=[{"role": "system", "content": SYSTEM},
                                          {"role": "user", "content": user_prompt}],
-                  reasoning_effort=EFFORT, max_completion_tokens=MAX_TOKENS, timeout=CALL_TIMEOUT)
-    if not _state["plain"]:
+                  timeout=CALL_TIMEOUT)
+    if level == 0:
+        kwargs.update(reasoning_effort=EFFORT, max_completion_tokens=MAX_TOKENS)
+    else:
+        kwargs["max_tokens"] = MAX_TOKENS
+    if level < 2:
         kwargs["response_format"] = {"type": "json_object"}
     return cl.chat.completions.create(**kwargs)
 
 
 def read(user_prompt):
     """One call. Returns (Reading, usage) or raises. A 404 retries once with /v1 appended to
-    the base URL; a 400 (a parameter the gateway refuses) retries once without response_format."""
+    the base URL; a 400 (a parameter the gateway refuses) steps down the compatibility
+    ladder, and the level that worked is remembered for later calls."""
     import openai
     cl = _client()
     if cl is None:
         raise RuntimeError("gateway not configured")
-    suffix, plain = _state["suffix"], _state["plain"]
-    try:
-        out = _create(cl, user_prompt)
-    except openai.NotFoundError:
-        if suffix or (os.environ.get("ARENA_LLM_BASE_URL") or "").rstrip("/").endswith("/v1"):
-            raise
-        _state["suffix"] = "/v1"                    # this call used the bare URL: retry with /v1
-        out = _create(_client(), user_prompt)
-    except openai.BadRequestError:
-        if plain:
-            raise
-        _state["plain"] = True                      # this call sent response_format: retry without
-        out = _create(cl, user_prompt)
+    suffix, level = _state["suffix"], _state["level"]
+    while True:
+        try:
+            out = _create(cl, user_prompt, level)
+            break
+        except openai.NotFoundError:
+            if suffix or (os.environ.get("ARENA_LLM_BASE_URL") or "").rstrip("/").endswith("/v1"):
+                raise
+            suffix = _state["suffix"] = "/v1"       # this call used the bare URL: retry with /v1
+            cl = _client()
+        except openai.BadRequestError:
+            if level >= 2:
+                raise
+            level += 1                              # a parameter the gateway refuses: step down
+            _state["level"] = max(_state["level"], level)
     content = (out.choices[0].message.content or "").strip()
     m = re.search(r"\{.*\}", content, re.S)          # tolerate a stray code fence
     reading = Reading.model_validate(json.loads(m.group(0) if m else content))
@@ -192,7 +202,7 @@ def healthy(cache):
     return len(cache) < MAX_CALLS
 
 
-_POOL = ThreadPoolExecutor(max_workers=4)
+_POOL = ThreadPoolExecutor(max_workers=6)
 USAGE = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
 
 

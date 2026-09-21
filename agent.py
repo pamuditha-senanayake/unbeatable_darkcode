@@ -183,7 +183,8 @@ def parse_rules(obs):
 BOARD_HEAD = re.compile(r"=== \d\d:\d\d \| tick \d+/\d+ \|")
 # the message refers to a place ("calling from X", "here at X", "(X)")
 SITE_REF = re.compile(r"\b(calling from|here at|we are at|this is .{2,30} again)\b|\(")
-USE_LLM = False             # SHA A: rules only. The LLM reader (llm_reader.py) is switched on in SHA B.
+USE_LLM = True              # SHA B: the LLM reader (llm_reader.py) reads every new ticket. False = rules only.
+LLM_PRIMARY = False         # level 4: take the model's reading first, the rules fill its gaps
 LLM_FILL = 0.6              # model confidence needed to fill what the rules left open
 LLM_HIGH = 0.85             # ... to overrule the rules on a high-stakes disagreement
 LLM_SURE = 0.9              # ... to take a site, or to close a ticket as not a job
@@ -481,37 +482,38 @@ class Agent:
         return cache, notes
 
     def _combine(self, j, blob, zone, trade, prio, llm, directory, sites, msgs, asked):
-        """Merge the model's reading with the regex reader's. Where both agree, act. Where
-        one is silent, the other fills in (the model only when confident). Where they
-        disagree on something high-stakes - a possible P1, or a trade the customer ruled out
-        - a confident model wins; any other disagreement is asked about (acting on the
-        rules meanwhile). What the game confirmed is never overruled.
+        """Merge the model's reading with the regex reader's. The rules win on the wording
+        they know (levels 1-3); the model fills what they left open (at LLM_FILL), raises a
+        possible P1 (at LLM_HIGH), corrects a trade the customer ruled out, takes a site only
+        for a place the message refers to, and holds a repeat only it sees. Disagreements are
+        never asked about (every question is a fee). With LLM_PRIMARY (for level 4's unknown
+        wording) the model's reading is taken first and the rules fill its gaps. What the game
+        confirmed is never overruled.
         Returns None (not a request) or (zone, trade, prio, asks, hold)."""
         c, jid, extra, hold = llm["confidence"], j["jid"], [], False
         ask = lambda topic: extra.append("[ask %s %s]" % (jid, topic)) if not asked(jid, topic) else None
         if llm["not_a_job"] and c >= LLM_SURE and trade is None and prio is None:
             return None
-        # priority
+        # priority: fill a gap at LLM_FILL; overrule only to raise a possible P1 at LLM_HIGH
         if j["prio"] is None and llm["prio"] in (1, 2, 3):
             if prio is None:
                 if c >= LLM_FILL:
                     prio = llm["prio"]
-            elif llm["prio"] != prio:
-                if 1 in (prio, llm["prio"]) and c >= LLM_HIGH:
-                    prio = llm["prio"]
-                else:
-                    ask("urgency")
-        # trade
+            elif llm["prio"] == 1 and prio != 1 and (c >= LLM_HIGH or LLM_PRIMARY):
+                prio = 1
+            elif LLM_PRIMARY and c >= LLM_FILL:
+                prio = llm["prio"]
+        # trade: fill a gap; never a trade the customer ruled out; overrule the rules only when
+        # they fell back on a ruled-out trade (or when the model reads first, LLM_PRIMARY)
         if j["skill"] is None and llm["trade"]:
             ruled_out = {t for phrase, t in EXONERATE if phrase in blob}
-            if trade is None:
-                if c >= LLM_FILL and llm["trade"] not in ruled_out:
+            if llm["trade"] not in ruled_out:
+                if trade is None:
+                    if c >= LLM_FILL:
+                        trade = llm["trade"]
+                elif llm["trade"] != trade and ((trade in ruled_out and c >= LLM_HIGH)
+                                                or (LLM_PRIMARY and c >= LLM_FILL)):
                     trade = llm["trade"]
-            elif llm["trade"] != trade and llm["trade"] not in ruled_out:
-                if trade in ruled_out and c >= LLM_HIGH:
-                    trade = llm["trade"]           # the rules fell back on a ruled-out trade
-                else:
-                    ask("problem")
         # site: only fill a gap, only a place the message refers to, never a decoy zone
         text = msgs.get(jid, {}).get("text", "").lower()
         if zone is None and llm["zone"] and c >= LLM_SURE and SITE_REF.search(text) \
