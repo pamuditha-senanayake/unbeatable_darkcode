@@ -472,7 +472,7 @@ class Agent:
         return routes, sum(value.values())
 
     def _insertion(self, plans, techs, travel, rules, now, recallable):
-        """Plan the routes; when a P1 would be refused or late, also try recalling each
+        """Plan the routes; when a job would be refused or late, also try recalling each
         technician who is on the road to lower-priority work (the game sets them down at that
         site at once, idle, and the job goes back into the pool). Keep whichever plan is worth
         more. Returns the unassign commands for the recalls made."""
@@ -482,14 +482,14 @@ class Agent:
         recalls = []
         planned = {id(p): (t, k) for t in crew for k, p in enumerate(routes[t["tid"]])}
 
-        def late_p1(routes):
+        def late_or_refused(routes):
             for t in crew:
                 _, legs = self._simulate(t, routes[t["tid"]], travel, rules, lam)
-                if any(p["prio"] == 1 and leg[2] < 1 for p, leg in zip(routes[t["tid"]], legs)):
+                if any(leg[2] < 1 for leg in legs):
                     return True
-            return any(p["prio"] == 1 and id(p) not in planned for p in plans)
+            return any(id(p) not in planned for p in plans)
 
-        if recallable and late_p1(routes):
+        if recallable and late_or_refused(routes):
             best = None
             for tid, back in recallable:
                 t = next((c for c in crew if c["tid"] == tid), None)
@@ -499,6 +499,10 @@ class Agent:
                 kept, _ = self._simulate(there, [back], travel, rules, lam)   # the job as it goes now
                 alt_crew = [there if c is t else c for c in crew]
                 alt_routes, alt_total = self._routes(plans + [back], alt_crew, travel, rules, lam)
+                if alt_routes[tid][:1] == [back]:
+                    # never recall just to hand the same job straight back: the game would set
+                    # the technician down there at once, a teleport, not a better plan
+                    continue
                 gain = alt_total - (total + kept)
                 if gain > 0 and (best is None or gain > best[0]):
                     best = (gain, t, there, back, alt_crew, alt_routes)
