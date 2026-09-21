@@ -26,6 +26,7 @@ Scheduling (level 2 has twice the work the fleet can do, so saying no is the job
 import random
 import re
 
+import handlers
 from common import (dd_now, dd_parse_directory, dd_parse_jobs, dd_parse_messages,
                     dd_parse_techs, dd_travel, detect_game)
 
@@ -592,6 +593,12 @@ class Agent:
             elif owner is None and j["zone"] is None:
                 anonymous.append(j)
         if len(named) == 1:
+            history = [{"jid": jid, "minute": m["minute"], "blob": (m["sender"] + " " + m["text"]).lower()}
+                       for jid, m in msgs.items()]
+            history = [h for h in history if not any(p in h["blob"] for p in NOT_A_JOB + FOLLOW_UP)]
+            if handlers.ambiguous_original(dup, who, topic, history,
+                                           lambda b: self._customer(b, directory), self._trade):
+                return None, None, named          # the open one may not be the original
             return named[0]["jid"], None, named
         if not named and len(anonymous) == 1 and who is not None:
             zone = next(c["zone"] for c in directory if c["name"] == who)
