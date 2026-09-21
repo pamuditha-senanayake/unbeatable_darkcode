@@ -262,6 +262,32 @@ class Agent:
             deadline = shift_end if sla is None else min(j["minute"] + sla, shift_end)
             plans.append({"job": j, "zone": zone, "trade": trade, "prio": prio, "deadline": deadline})
 
+        # Re-plan every tick: jobs still waiting in a queue (nobody on the road to them yet)
+        # go back into the pool, so a new P1 can jump ahead of queued P3 work.
+        current = {t["tid"]: list(t["queue"]) for t in techs}
+        replannable = set()
+        for j in jobs:
+            if j["status"] != "queued":
+                continue
+            blob = self._blob(j, msgs)
+            sent = re.findall(r"\[assign T\d+ %s (\S+)\]" % j["jid"], mine)
+            zone = j["zone"] or (sent[-1] if sent else None)
+            if zone is None:
+                continue
+            trade = j["skill"] or self._trade(blob) or "electrical"
+            prio = j["prio"] or self._priority(blob) or 2
+            sla = rules["sla"].get(prio)
+            deadline = shift_end if sla is None else min(j["minute"] + sla, shift_end)
+            plans.append({"job": j, "zone": zone, "trade": trade, "prio": prio, "deadline": deadline})
+            replannable.add(j["jid"])
+        for t in techs:
+            # a queued job we could not re-plan (unreadable row) stays where it is, in front
+            t["queue"] = [(jid, None) for jid in t["queue"] if jid not in replannable]
+            t["free_at"] = max(now, t["until"] or now)
+            if t["activity"] == "travel":         # the job they are driving to still has to be done
+                cur = next((j for j in jobs if j["jid"] == t["job"]), None)
+                t["free_at"] += DURATION_GUESS.get(cur and (cur["skill"] or self._trade(self._blob(cur, msgs))), 45)
+
         # earliest deadline first, and a P1 ahead of a P3 that shares its deadline
         plans.sort(key=lambda p: (p["deadline"], p["prio"]))
         assigns = []
@@ -287,10 +313,24 @@ class Agent:
                     best, best_arrival, best_net = t, arrival, net
             if best is None:
                 continue
-            assigns.append("[assign %s %s %s]" % (best["tid"], p["job"]["jid"], p["zone"]))
-            best["queue"] = best["queue"] + [p["job"]["jid"]]
+            best["queue"] = best["queue"] + [(p["job"]["jid"], p["zone"])]
             best["free_at"] = best_arrival + DURATION_GUESS[p["trade"]]
             best["at"] = p["zone"]
+
+        # Send only the differences. Re-assigning a queued job moves it to the back of the
+        # named queue, so everything after the first change in a queue is re-sent in order.
+        planned = {jid for t in techs for jid, _ in t["queue"]}
+        for t in techs:
+            want = t["queue"]
+            have = current[t["tid"]]
+            k = 0
+            while k < len(want) and k < len(have) and want[k][0] == have[k]:
+                k += 1
+            for jid in have[k:]:
+                if jid in replannable and jid not in planned:
+                    assigns.append("[unassign %s]" % jid)
+            assigns += ["[assign %s %s %s]" % (t["tid"], jid, zone) for jid, zone in want[k:] if zone]
+            t["queue"] = [jid for jid, _ in want]
 
         # A job whose site is unknown: rather than ask (a fee and a lost tick), send an idle
         # technician with the right skill to the zone they are already standing in. A wrong
