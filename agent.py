@@ -103,7 +103,7 @@ MAX_QUEUE = 2                   # jobs sent to a technician's queue; the rest of
 # twice the work it can do), so there it scales with the load: nothing below LOAD_LO of the
 # remaining capacity, the full OPP from LOAD_HI up.
 OPP = 0.2
-LOAD_LO, LOAD_HI = 0.6, 1.0
+LOAD_LO, LOAD_HI = 0.5, 1.0
 INS_PASSES = 2                  # relocation passes over the routes
 LIGHT_AFTER = 12.0              # seconds into a reply: skip the relocation passes and recalls
 FALLBACK_AFTER = 30.0           # ... : send the plain earliest-deadline plan instead
