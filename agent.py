@@ -1,24 +1,28 @@
-"""Reference policy: read the ticket properly before dispatching.
+"""DispatchDesk agent: read the tickets with rules, schedule in code.
 
-The keyword anchor loses points in three specific ways, and this agent fixes each one
-without any model in the loop. It is the "a careful human would do this" baseline:
+Reading (no model in the loop):
 
 * **Negated urgency.** Half the P3 tickets are written "no need to hurry, it is not
   critical" - a substring match on "hurry"/"critical" reads them as emergencies. So the
   calm phrasings are checked FIRST and only then the alarm words.
 * **The decoy trade.** Vague tickets describe a symptom in the vocabulary of the wrong
-  trade, and usually say out loud that the obvious trade has been ruled out ("the
-  electrician we called said it is not his thing", "power is fine", "water side looks
-  fine"). Those exonerations remove a trade from the running, and a few cause-level
-  rules catch the rest - several unrelated systems failing at one instant is an
-  electrical supply fault, not a coincidence.
+  trade, and usually say out loud that the obvious trade has been ruled out ("power is
+  fine"). Those exonerations remove a trade, and a few cause-level rules catch the rest.
 * **The decoy place.** "Our driver is coming from Kista" names a zone that is not the
-  site. So a zone is only believed when it comes from the customer directory (name or
-  nickname) or from the game itself; a bare zone name in the prose is ignored and the
-  site is asked for instead.
+  site. A zone is only believed from the directory (name or nickname), the game, or a
+  repeat from a named customer; a zone named in the prose is struck off the candidates.
 
-It then dispatches by SLA deadline rather than by guessed priority, and refuses work it
-cannot finish before the shift ends, because overtime at 1/min outruns a P3's 10 points.
+Scheduling (level 2 has twice the work the fleet can do, so saying no is the job):
+
+* Re-plan every tick, earliest SLA deadline first. Each job goes to the technician with
+  the best expected net (value by the chance of finishing inside the SLA, minus travel,
+  overtime and the minutes it ties them up). When the fleet is overloaded a job must also
+  pay for those minutes, or it is refused.
+* A P1 that would be late recalls a technician on the road to lower-priority work.
+* An unknown P1/P2 site is probed at the zone that minimises the expected detour, and
+  asked about when the answer lands before the technician sets off.
+* Repeats are never dispatched; merged only when the original is certain (a merge earns
+  nothing, a wrong one costs 15).
 """
 import random
 import re
@@ -81,6 +85,27 @@ TOPIC = [(["air con", "aircon", "air conditioning"], "HVAC"), (["fridge", "cold 
 DURATION_GUESS = {"HVAC": 60, "refrigeration": 60, "electrical": 45, "IT": 40, "lift": 75,
                   "plumbing": 50}
 MAX_QUEUE = 2
+# What a minute of technician time is worth to the work still to come. Charging it when
+# choosing a technician sends each job to whoever finishes it soonest; charging it when
+# deciding whether to take a job at all only pays when the fleet is overloaded (level 2 has
+# twice the work it can do), so there it scales with the load: nothing below LOAD_LO of the
+# remaining capacity, the full OPP from LOAD_HI up.
+OPP = 0.2
+LOAD_LO, LOAD_HI = 0.6, 1.0
+LOAD_UNTIL = 360                # tickets stopped arriving around 14:00 on the practice shifts
+WRONG_SITE_MIN = 15             # a visit to the wrong site costs the technician 15 minutes
+# How often each trade came from each zone over practice shifts 1-50 (levels 1 and 2, the
+# six-zone city). Only used while the travel table shows those zones; any other city falls
+# back to weighting each zone by the number of directory customers in it.
+ZONE_PRIOR = {
+    "electrical": {"Solna": .24, "Sodermalm": .23, "Sundbyberg": .23, "Nacka": .19, "Kista": .11},
+    "plumbing": {"Sundbyberg": .50, "Sodermalm": .29, "Nacka": .21},
+    "HVAC": {"Solna": .36, "Sodermalm": .21, "Sundbyberg": .16, "Kista": .15, "Nacka": .12},
+    "IT": {"Kista": .36, "Solna": .31, "Nacka": .16, "Sodermalm": .16},
+    "refrigeration": {"Nacka": .28, "Sodermalm": .26, "Sundbyberg": .26, "Kista": .20},
+    "lift": {"Kista": .43, "Nacka": .31, "Solna": .26},
+}
+ZONE_PRIOR_ZONES = {"Kista", "Solna", "Sundbyberg", "Sodermalm", "Nacka"}
 # Work takes 30 to 90 minutes "depending on the fault" (rules); the spread seen per trade on
 # practice shifts. Used to weigh the chance a job finishes inside its SLA, not just the mean.
 DURATION_SPREAD = {"HVAC": (30, 90), "refrigeration": (30, 90), "electrical": (30, 60), "IT": (30, 60),
@@ -210,178 +235,279 @@ class Agent:
         now, tick, ticks = dd_now(obs)
         rules = parse_rules(obs)
         shift_end = rules["shift_end"]
-
-        for t in techs:
-            t["free_at"] = max(now, t["until"] or now) + 45 * len(t["queue"])
-            t["at"] = t["dest"] or t["zone"]
+        byid = {j["jid"]: j for j in jobs}
+        # customer sites: a job whose site is unknown is at one of these, never at the depot
+        sites = sorted({c["zone"] for c in directory if c["zone"] in travel}) \
+            or [z for z in travel if z != "Depot"] or list(travel)
 
         # Only our own replies count as "asked": the rules text and the board footer both
         # print example asks ("[ask J7 location]", "[ask J4 location]").
         mine = " ".join(l for l in obs.splitlines() if l.startswith("[Player]"))
         asked = lambda jid, topic: "[ask %s %s]" % (jid, topic) in mine
 
-        closes, merges, asks, plans, probes = [], [], [], [], []
+        # ---- repeats first: they can tell us where an anonymous original is
+        closes, merges, asks, asks_p3, plans = [], [], [], [], []
+        hints, repeats = {}, set()
         for j in jobs:
             if j["status"] != "unassigned":
                 continue
             blob = self._blob(j, msgs)
-
             if any(p in blob for p in NOT_A_JOB):
                 closes.append("[ignore %s]" % j["jid"])
+                repeats.add(j["jid"])
                 continue
-            if any(p in blob for p in FOLLOW_UP):
-                orig = self._original(j, blob, jobs, msgs, directory, obs)
-                if orig:
-                    merges.append("[merge %s %s]" % (j["jid"], orig))
-                    continue
-                # A repeat whose original we cannot name: confirm it before sending anyone.
-                # Once the customer says it is the same issue, leave it; the original is handled.
-                if not asked(j["jid"], "problem"):
-                    asks.append("[ask %s problem]" % j["jid"])
-                    continue
-                if re.search(r"about %s \(problem\): \"yes - this is the same issue" % j["jid"], obs.lower()):
-                    continue
-                if j["skill"] is None:
-                    continue                      # answer still pending
+            if not any(p in blob for p in FOLLOW_UP):
+                continue
+            # The customer answered the problem question and it is not "the same issue":
+            # a new job after all, read it like any other.
+            if asked(j["jid"], "problem") and j["skill"] and not re.search(
+                    r"about %s \(problem\): \"yes - this is the same issue" % j["jid"], obs.lower()):
+                continue
+            repeats.add(j["jid"])                 # a likely repeat is never dispatched
+            orig, hint, candidates = self._original(j, blob, jobs, msgs, directory, obs)
+            if orig:
+                merges.append("[merge %s %s]" % (j["jid"], orig))
+            elif hint:
+                hints.setdefault(hint[0], hint[1])
+            elif not candidates and self._customer(blob, directory) is None \
+                    and not asked(j["jid"], "problem"):
+                asks_p3.append("[ask %s problem]" % j["jid"])   # unclear which job it follows: ask once
 
-            zone = j["zone"] or self._site(blob, directory)
+        # ---- read every real job still waiting for a technician
+        for j in jobs:
+            if j["status"] != "unassigned" or j["jid"] in repeats:
+                continue
+            blob = self._blob(j, msgs)
+            zone = j["zone"] or self._site(blob, directory) or hints.get(j["jid"])
             trade = j["skill"] or self._trade(blob)
             prio = j["prio"] or self._priority(blob)
-            # Ask about whatever the text does not tell us, all in the same tick. Once an
-            # answer is in, the game shows it on the row; if it is still pending, hold the job.
-            if zone is None and trade and prio in (1, 2) and not asked(j["jid"], "location"):
-                # P1/P2 with an unknown site: try to probe it (below). A P3 can afford the
-                # tick an ask takes, and probing it burns technician time for 10 points.
-                sla = rules["sla"].get(prio)
-                probes.append({"job": j, "trade": trade, "prio": prio,
-                               "deadline": shift_end if sla is None else min(j["minute"] + sla, shift_end)})
-                continue
-            # An ask only pays when the job is worth more than the fees plus the drive it will
-            # cost. For a P3 (10) with an unknown site, 5 + an average drive usually is not.
-            need = [t for v, t in ((zone, "location"), (trade, "problem"), (prio, "urgency"))
-                    if v is None and not asked(j["jid"], t)]
-            if need and prio is not None and travel:
-                crew = [t for t in techs if not t["off_shift"] and (trade is None or trade in t["skills"])]
-                sites = [z for z in travel if z != "Depot"] or list(travel)
-                drive = (sum(min(travel.get(t["at"], {}).get(z, 30) for t in crew) for z in sites) / len(sites)
-                         if zone is None and crew else 0)
-                if rules["value"].get(prio, 0) - rules["fee"] * len(need) - rules["travel"] * drive <= 0:
-                    continue
-            for value, topic in ((zone, "location"), (trade, "problem"), (prio, "urgency")):
-                if value is None:
-                    if not asked(j["jid"], topic):
-                        asks.append("[ask %s %s]" % (j["jid"], topic))
-            # hold the job while an answer is pending; after the answer, fall back to defaults
-            if zone is None or (trade is None and not asked(j["jid"], "problem")) \
-                    or (prio is None and not asked(j["jid"], "urgency")):
+            # Unreadable trade or urgency: ask, and hold the job until the answer is in; after
+            # it, fall back to defaults. An unknown site is not held: it is probed (below).
+            need = [t for v, t in ((trade, "problem"), (prio, "urgency")) if v is None and not asked(j["jid"], t)]
+            if need:
+                if prio is None or rules["value"].get(prio, 0) > rules["fee"] * len(need):
+                    for topic in need:
+                        (asks if prio in (1, 2, None) else asks_p3).append("[ask %s %s]" % (j["jid"], topic))
                 continue
             trade = trade or "electrical"
             prio = prio or 2
-            sla = rules["sla"].get(prio)
-            deadline = shift_end if sla is None else min(j["minute"] + sla, shift_end)
-            plans.append({"job": j, "zone": zone, "trade": trade, "prio": prio, "deadline": deadline})
+            if zone is None and prio >= 3:
+                # A P3 is not worth a probe: a wrong site ties a technician up for 10 points.
+                # Ask when the fee plus the likely drive still leaves something, and hold it.
+                if not asked(j["jid"], "location"):
+                    crew = [t for t in techs if not t["off_shift"] and trade in t["skills"]]
+                    drive = (sum(min(travel.get(t["dest"] or t["zone"], {}).get(z, 30) for t in crew)
+                                 for z in sites) / len(sites)) if crew else 99
+                    if rules["value"].get(prio, 0) - rules["fee"] - rules["travel"] * drive > 0:
+                        asks_p3.append("[ask %s location]" % j["jid"])
+                continue
+            plans.append(self._plan(j, zone, trade, prio, blob, directory, sites, rules))
 
-        # Re-plan every tick: jobs still waiting in a queue (nobody on the road to them yet)
-        # go back into the pool, so a new P1 can jump ahead of queued P3 work.
+        # ---- re-plan every tick: queued jobs (nobody on the road yet) rejoin the pool, so a
+        # new P1 can jump ahead of queued P3 work
         current = {t["tid"]: list(t["queue"]) for t in techs}
         replannable = set()
         for j in jobs:
             if j["status"] != "queued":
                 continue
             blob = self._blob(j, msgs)
-            sent = re.findall(r"\[assign T\d+ %s (\S+)\]" % j["jid"], mine)
-            zone = j["zone"] or (sent[-1] if sent else None)
-            if zone is None:
-                continue
+            zone = j["zone"] or self._site(blob, directory) or hints.get(j["jid"])
             trade = j["skill"] or self._trade(blob) or "electrical"
             prio = j["prio"] or self._priority(blob) or 2
-            sla = rules["sla"].get(prio)
-            deadline = shift_end if sla is None else min(j["minute"] + sla, shift_end)
-            plans.append({"job": j, "zone": zone, "trade": trade, "prio": prio, "deadline": deadline})
+            plans.append(self._plan(j, zone, trade, prio, blob, directory, sites, rules))
             replannable.add(j["jid"])
+
         for t in techs:
-            # a queued job we could not re-plan (unreadable row) stays where it is, in front
+            # a queued job we could not re-plan stays where it is, in front
             t["queue"] = [(jid, None) for jid in t["queue"] if jid not in replannable]
-            t["free_at"] = max(now, t["until"] or now)
+            t["at"] = t["dest"] or t["zone"]
+            t["free_at"] = max(now, t["until"] or now) + 45 * len(t["queue"])
+            cur = byid.get(t["job"])
             if t["activity"] == "travel":         # the job they are driving to still has to be done
-                cur = next((j for j in jobs if j["jid"] == t["job"]), None)
                 t["free_at"] += DURATION_GUESS.get(cur and (cur["skill"] or self._trade(self._blob(cur, msgs))), 45)
+            elif t["activity"] == "wasted" and cur and cur["status"] == "rerouting" and cur["zone"]:
+                # at a wrong site: after the 15 minutes they drive on to the true one and work
+                t["free_at"] += travel.get(t["zone"], {}).get(cur["zone"], 30) \
+                    + DURATION_GUESS.get(cur["skill"] or self._trade(self._blob(cur, msgs)), 45)
+                t["at"] = cur["zone"]
 
-        # A P1/P2 whose site is unknown: rather than ask (a fee and a lost tick), send a
-        # technician with the right skill to the zone they are standing in (or about to be
-        # in). A wrong site costs them 15 minutes, reveals the true zone and they drive
-        # straight on; the drive is the one they would have made anyway. P1 probes are
-        # planned first (a queued job must not take the technician a P1 needs to find its
-        # site); P2 probes take their turn in deadline order, so they cannot jump a P1.
-        # With no suitable technician free soon, ask.
-        sites = [z for z in travel if z != "Depot"] or list(travel)
-        for p in probes:
-            p["probe"] = True
+        # ---- how loaded the fleet is: the work waiting (and, at the rate tickets have come in
+        # so far, still to come) against the technician minutes left. Refusing work only pays
+        # when there is more of it than the fleet can do.
+        self.load = self._load(plans, techs, msgs, now, rules)
 
-        # P1 probes, then earliest deadline first, and a P1 ahead of a P3 at the same deadline
-        plans = sorted(plans + probes, key=lambda p: (not (p.get("probe") and p["prio"] == 1), p["deadline"], p["prio"]))
-        assigns = []
-        for p in plans:
-            if p.get("probe"):
-                # One who finishes within 15 min still beats an ask, whose answer only
-                # comes at the next tick.
-                idle = [t for t in techs if p["trade"] in t["skills"] and not t["off_shift"] and not t["queue"]
-                        and t["at"] in travel and t["free_at"] <= now + 15
-                        and t["free_at"] + 15 + 45 + DURATION_GUESS.get(p["trade"], 60) <= (t["shift_end"] or shift_end)]
-                if not idle or not travel:
-                    asks.append("[ask %s location]" % p["job"]["jid"])
-                    continue
-                t = min(idle, key=lambda t: (t["free_at"], sum(travel.get(t["at"], {}).get(z, 30) for z in sites)))
-                t["queue"] = [(p["job"]["jid"], t["at"])]
-                t["free_at"] += 60 + DURATION_GUESS.get(p["trade"], 60)
-                continue
+        # ---- earliest deadline first, a P1 ahead of a P3 at the same deadline
+        plans.sort(key=lambda p: (p["deadline"], p["prio"]))
+        recalls = []
+        k = 0
+        while k < len(plans):
+            p = plans[k]
+            k += 1
             # Pick the technician with the best expected net: value earned (half if past the
-            # SLA, nothing past the 19:00 hard stop) minus travel and their own overtime.
-            # A job no technician can do at a profit is left alone, whatever its priority.
-            best, best_arrival, best_net = None, None, 0.0
-            duration = DURATION_GUESS[p["trade"]]
+            # SLA, nothing past the 19:00 hard stop) minus travel, their own overtime and the
+            # time it ties them up. A job nobody can do at a profit is left alone.
+            best = None
             for t in techs:
                 if p["trade"] not in t["skills"] or t["off_shift"] or len(t["queue"]) >= MAX_QUEUE:
                     continue
-                drive = travel.get(t["at"], {}).get(p["zone"], 30)
-                arrival = t["free_at"] + drive
-                finish = arrival + duration
-                own_end = t["shift_end"] or shift_end
-                # expected value over the likely durations: a finish a few minutes past the SLA
-                # is a coin flip, not a certainty either way
-                lo, hi = DURATION_SPREAD.get(p["trade"], (duration, duration))
-                outcomes = [arrival + d <= p["deadline"] for d in (lo, duration, hi)]
-                on_time = sum(outcomes) / 3.0
-                value = rules["value"].get(p["prio"], 0) * (on_time + (1 - on_time) * rules["late"])
-                if finish > rules["hard_stop"]:
-                    value = 0.0
-                overtime = max(0, finish - max(own_end, t["free_at"]))
-                net = value - rules["travel"] * drive - rules["overtime"] * overtime
-                if net > best_net:
-                    best, best_arrival, best_net = t, arrival, net
+                if t["at"] not in travel:
+                    continue
+                opt = self._score(t, t["free_at"], t["at"], p, travel, rules)
+                if opt["accept"] > 0 and (best is None or opt["net"] > best["net"]):
+                    best = opt
+            # A P1 that will be late: a technician on the road to lower-priority work can be
+            # recalled. They still reach that site (the drive is sunk), take the P1 from there,
+            # and the recalled job goes back into the pool.
+            if p["prio"] == 1 and (best is None or best["on_time"] < 1):
+                for t in techs:
+                    cur = byid.get(t["job"])
+                    if t["activity"] != "travel" or not cur or cur["status"] != "travelling" or t["queue"] \
+                            or p["trade"] not in t["skills"] or t["off_shift"] or not t["dest"] or not t["until"]:
+                        continue
+                    cblob = self._blob(cur, msgs)
+                    cprio = cur["prio"] or self._priority(cblob) or 2
+                    if cprio == 1 or cur["jid"] in repeats:
+                        continue
+                    opt = self._score(t, max(now, t["until"]), t["dest"], p, travel, rules)
+                    if opt["on_time"] >= 1 and opt["accept"] > 0 and (best is None or opt["net"] > best["net"]):
+                        best = dict(opt, recall=cur, cprio=cprio, cblob=cblob)
+            p["tech"] = best and best["tech"]
             if best is None:
                 continue
-            best["queue"] = best["queue"] + [(p["job"]["jid"], p["zone"])]
-            best["free_at"] = best_arrival + DURATION_GUESS[p["trade"]]
-            best["at"] = p["zone"]
+            t = best["tech"]
+            if best.get("recall"):
+                cur = best["recall"]
+                recalls.append("[unassign %s]" % cur["jid"])
+                t["free_at"], t["at"] = max(now, t["until"]), t["dest"]
+                back = self._plan(cur, cur["zone"] or t["dest"], cur["skill"] or self._trade(best["cblob"]) or "electrical",
+                                  best["cprio"], best["cblob"], directory, sites, rules)
+                back["job"] = dict(cur, status="unassigned")
+                plans.insert(k, back)
+                plans[k:] = sorted(plans[k:], key=lambda p: (p["deadline"], p["prio"]))
+                best = self._score(t, t["free_at"], t["at"], p, travel, rules)
+            t["queue"] = t["queue"] + [(p["job"]["jid"], best["zone"])]
+            p["departs"] = t["free_at"]
+            t["free_at"] = best["finish"]
+            t["at"] = p["zone"] or best["zone"]
 
-        # Send only the differences. Re-assigning a queued job moves it to the back of the
+        # ---- an unknown site: ask when the answer lands before the technician sets off (the
+        # game sends them to the confirmed site then), or when nobody can take a P1/P2 yet
+        for p in plans:
+            jid = p["job"]["jid"]
+            if p["zone"] is not None or asked(jid, "location"):
+                continue
+            if p["tech"] is not None and p["departs"] >= now + rules["tick"]:
+                (asks if p["prio"] in (1, 2) else asks_p3).append("[ask %s location]" % jid)
+            elif p["tech"] is None and p["prio"] in (1, 2) and p["job"]["status"] == "unassigned":
+                asks.append("[ask %s location]" % jid)
+
+        # ---- send only the differences. Re-assigning a queued job moves it to the back of the
         # named queue, so everything after the first change in a queue is re-sent in order.
+        prio_of = {p["job"]["jid"]: p["prio"] for p in plans}
         planned = {jid for t in techs for jid, _ in t["queue"]}
+        urgent, later = [], []
         for t in techs:
             want = t["queue"]
             have = current[t["tid"]]
             k = 0
             while k < len(want) and k < len(have) and want[k][0] == have[k]:
                 k += 1
-            for jid in have[k:]:
-                if jid in replannable and jid not in planned:
-                    assigns.append("[unassign %s]" % jid)
-            assigns += ["[assign %s %s %s]" % (t["tid"], jid, zone) for jid, zone in want[k:] if zone]
+            cmds = ["[unassign %s]" % jid for jid in have[k:] if jid in replannable and jid not in planned]
+            cmds += ["[assign %s %s %s]" % (t["tid"], jid, zone) for jid, zone in want[k:] if zone]
+            if cmds:
+                top = min([prio_of.get(jid, 3) for jid, _ in want[k:]] + [3])
+                (urgent if top <= 2 else later).append((top, cmds))
             t["queue"] = [jid for jid, _ in want]
+        urgent = recalls + [c for _, cs in sorted(urgent, key=lambda x: x[0]) for c in cs]
+        later = [c for _, cs in later for c in cs]
 
-        cmds = closes + merges + assigns + asks
+        # P1/P2 dispatches first, then questions, then P3 dispatches; closing repeats and
+        # non-requests costs nothing to put off a tick. At most four, and always [wait].
+        cmds = urgent + asks + asks_p3 + later + merges + closes
         return " ".join(cmds[:4] + ["[wait]"])
+
+    def _score(self, t, free_at, at, p, travel, rules):
+        """What sending technician t (free at `free_at`, standing at `at`) to plan p is worth."""
+        duration = DURATION_GUESS[p["trade"]]
+        lo, hi = DURATION_SPREAD.get(p["trade"], (duration, duration))
+        zone, drive, delay = self._route(at, p, travel)
+        arrival = free_at + drive + delay
+        finish = arrival + duration
+        own_end = t["shift_end"] or rules["shift_end"]
+        # expected value over the likely durations: a finish a few minutes past the SLA is a
+        # coin flip, not a certainty either way
+        on_time = sum(arrival + d <= p["deadline"] for d in (lo, duration, hi)) / 3.0
+        value = rules["value"].get(p["prio"], 0) * (on_time + (1 - on_time) * rules["late"])
+        if finish > rules["hard_stop"]:
+            value = 0.0
+        overtime = max(0, finish - max(own_end, free_at))
+        base = value - rules["travel"] * drive - rules["overtime"] * overtime
+        return {"tech": t, "zone": zone, "finish": finish, "on_time": on_time,
+                "net": base - self._opp(p) * (finish - free_at),
+                "accept": base - self._accept_opp() * (finish - free_at)}
+
+    def _plan(self, j, zone, trade, prio, blob, directory, sites, rules):
+        sla = rules["sla"].get(prio)
+        deadline = rules["shift_end"] if sla is None else min(j["minute"] + sla, rules["shift_end"])
+        p = {"job": j, "zone": zone, "trade": trade, "prio": prio, "deadline": deadline, "tech": None}
+        if zone is None:
+            p["cands"] = self._zone_odds(trade, blob, directory, sites)
+        return p
+
+    @staticmethod
+    def _zone_odds(trade, blob, directory, sites):
+        """Where an anonymous job probably is: the customer sites, weighted by how often this
+        trade came from each on the practice shifts, minus any place the message names (a
+        place named in the prose is never the site: "our driver is coming from Kista")."""
+        prior = ZONE_PRIOR.get(trade, {})
+        known = bool(prior) and set(sites) <= ZONE_PRIOR_ZONES
+        odds = {}
+        for z in sites:
+            if re.search(r"\b%s\b" % re.escape(z.lower()), blob):
+                continue
+            w = prior.get(z, 0.0) if known else sum(1 for c in directory if c["zone"] == z) or 1
+            if w > 0:
+                odds[z] = w
+        if not odds:
+            odds = {z: 1.0 for z in sites}
+        total = sum(odds.values())
+        return {z: w / total for z, w in odds.items()}
+
+    @staticmethod
+    def _route(at, p, travel):
+        """(zone to send them to, expected minutes on the road, expected minutes lost at a
+        wrong site) for a technician standing at `at`."""
+        if p["zone"] is not None:
+            return p["zone"], travel.get(at, {}).get(p["zone"], 30), 0.0
+        best = None
+        for z, pz in p["cands"].items():
+            onward = sum(q * travel.get(z, {}).get(z2, 30) for z2, q in p["cands"].items() if z2 != z)
+            drive = travel.get(at, {}).get(z, 30) + onward
+            delay = (1 - pz) * WRONG_SITE_MIN
+            if best is None or drive + delay < best[1] + best[2]:
+                best = (z, drive, delay)
+        return best
+
+    def _accept_opp(self):
+        return OPP * min(1.0, max(0.0, (self.load - LOAD_LO) / (LOAD_HI - LOAD_LO)))
+
+    @staticmethod
+    def _load(plans, techs, msgs, now, rules):
+        work = sum(DURATION_GUESS.get(p["trade"], 50) + 20 for p in plans)
+        for t in techs:
+            if t["activity"] in ("travel", "work", "wasted") and t["until"]:
+                work += max(0, t["until"] - now)
+        # tickets still to come, at the rate they have arrived so far (about 4 in 5 are real
+        # jobs, each about 70 minutes of work and driving)
+        rate = len(msgs) / float(max(60, now + 30))
+        work += max(0, LOAD_UNTIL - now) * rate * 0.8 * 70
+        cap = sum(max(0, (t["shift_end"] or rules["shift_end"]) - now) for t in techs if not t["off_shift"])
+        return work / max(1.0, cap)
+
+    @staticmethod
+    def _opp(p):
+        """What a minute of technician time is worth to the work still to come."""
+        return OPP
 
     def _blob(self, j, msgs):
         """Sender and text, lower-cased. The job row cuts the sender at 28 characters, so
@@ -390,13 +516,14 @@ class Agent:
         return (m.get("sender", j["sender"]) + " " + m.get("text", "")).lower()
 
     def _original(self, dup, blob, jobs, msgs, directory, obs=""):
-        """The earlier open job this repeat is about: same customer, and when the customer
-        has several, the one whose trade matches what the follow-up says it is about."""
+        """What this repeat follows up: (job to merge into, (anonymous job, its zone), the
+        candidates). Merging only closes the repeat, it earns nothing, while a wrong merge
+        costs 15. So merge only when exactly one open job of the same customer matches what
+        the follow-up is about; otherwise leave the repeat alone (it is never dispatched).
+        When the original was anonymous, the repeat tells us where it is."""
         who = self._customer(blob, directory)
-        if who is None:
-            return None
         topic = next((trade for words, trade in TOPIC if any(w in blob for w in words)), None)
-        found = []
+        named, anonymous = [], []
         for j in jobs:
             if j["jid"] == dup["jid"] or j["minute"] > dup["minute"]:
                 continue
@@ -406,10 +533,16 @@ class Agent:
             # never merge into a non-request (we ignore it) or into another repeat
             if any(p in other for p in NOT_A_JOB) or any(p in other for p in FOLLOW_UP):
                 continue
-            if self._customer(other, directory) == who:
-                found.append((j, other))
-        if topic:
-            for j, other in found:
-                if (j["skill"] or self._trade(other)) == topic:
-                    return j["jid"]
-        return found[0][0]["jid"] if found else None
+            if topic and (j["skill"] or self._trade(other)) != topic:
+                continue
+            owner = self._customer(other, directory)
+            if who is not None and owner == who:
+                named.append(j)
+            elif owner is None and j["zone"] is None:
+                anonymous.append(j)
+        if len(named) == 1:
+            return named[0]["jid"], None, named
+        if not named and len(anonymous) == 1 and who is not None:
+            zone = next(c["zone"] for c in directory if c["name"] == who)
+            return None, (anonymous[0]["jid"], zone), anonymous
+        return None, None, named + anonymous
