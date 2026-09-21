@@ -81,6 +81,10 @@ TOPIC = [(["air con", "aircon", "air conditioning"], "HVAC"), (["fridge", "cold 
 DURATION_GUESS = {"HVAC": 60, "refrigeration": 60, "electrical": 45, "IT": 40, "lift": 75,
                   "plumbing": 50}
 MAX_QUEUE = 2
+# Work takes 30 to 90 minutes "depending on the fault" (rules); the spread seen per trade on
+# practice shifts. Used to weigh the chance a job finishes inside its SLA, not just the mean.
+DURATION_SPREAD = {"HVAC": (30, 90), "refrigeration": (30, 90), "electrical": (30, 60), "IT": (30, 60),
+                   "lift": (60, 90), "plumbing": (30, 60)}
 
 # The rules text at the top of every episode is the authority; these are only what it said
 # on levels 1-4, used when a value cannot be read from it (the final round changes a rule).
@@ -343,7 +347,12 @@ class Agent:
                 arrival = t["free_at"] + drive
                 finish = arrival + duration
                 own_end = t["shift_end"] or shift_end
-                value = rules["value"].get(p["prio"], 0) * (1.0 if finish <= p["deadline"] else rules["late"])
+                # expected value over the likely durations: a finish a few minutes past the SLA
+                # is a coin flip, not a certainty either way
+                lo, hi = DURATION_SPREAD.get(p["trade"], (duration, duration))
+                outcomes = [arrival + d <= p["deadline"] for d in (lo, duration, hi)]
+                on_time = sum(outcomes) / 3.0
+                value = rules["value"].get(p["prio"], 0) * (on_time + (1 - on_time) * rules["late"])
                 if finish > rules["hard_stop"]:
                     value = 0.0
                 overtime = max(0, finish - max(own_end, t["free_at"]))
