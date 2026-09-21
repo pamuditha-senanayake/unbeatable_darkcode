@@ -26,7 +26,12 @@ Scheduling (level 2 has twice the work the fleet can do, so saying no is the job
 """
 import random
 import re
+import time
 
+try:
+    import llm_reader
+except Exception:                                   # no helper file: rules only
+    llm_reader = None
 from common import (dd_now, dd_parse_directory, dd_parse_jobs, dd_parse_messages,
                     dd_parse_techs, dd_travel, detect_game)
 
@@ -164,17 +169,28 @@ def parse_rules(obs):
 
 
 BOARD_HEAD = re.compile(r"=== \d\d:\d\d \| tick \d+/\d+ \|")
+# the message refers to a place ("calling from X", "here at X", "(X)") that the directory
+# could not resolve: the one site question a model can answer and the rules cannot
+SITE_REF = re.compile(r"\b(calling from|here at|we are at|this is .{2,30} again)\b|\(")
+LLM_FILL = 0.6              # model confidence needed to fill a priority or trade the rules left open
+LLM_SURE = 0.9              # ... to take a site, or to close a ticket as not a job
 
 
 class Agent:
     def __init__(self):
         self.rng = random.Random(7)
+        self.started = time.monotonic()
+        try:
+            self.llm = llm_reader.client() if llm_reader else None
+        except Exception:
+            self.llm = None
 
     def reset(self, game_id, player_id):
         self.game_id = game_id
 
     def __call__(self, observation):
         # Never raise: a raised reply is a fault, and four faults lose the shift.
+        self.started = time.monotonic()
         try:
             observation = observation.replace("\r\n", "\n")
             # the intro may be missing from a cut history; a board header is enough to play
@@ -273,6 +289,13 @@ class Agent:
                     and not asked(j["jid"], "problem"):
                 asks_p3.append("[ask %s problem]" % j["jid"])   # unclear which job it follows: ask once
 
+        # ---- the model, only where the rules are unsure (and one health check per shift)
+        cache, notes = {}, []
+        try:
+            cache, notes = self._consult(jobs, msgs, directory, techs, sites, repeats, obs)
+        except Exception:
+            pass
+
         # ---- read every real job still waiting for a technician
         for j in jobs:
             if j["status"] != "unassigned" or j["jid"] in repeats:
@@ -281,6 +304,12 @@ class Agent:
             zone = j["zone"] or self._site(blob, directory) or hints.get(j["jid"])
             trade = j["skill"] or self._trade(blob)
             prio = j["prio"] or self._priority(blob)
+            llm = cache.get(j["jid"])
+            if llm:
+                if llm["not_a_job"] and llm["confidence"] >= LLM_SURE and trade is None and prio is None:
+                    closes.append("[ignore %s]" % j["jid"])  # the rules could read nothing either
+                    continue
+                zone, trade, prio = self._with_model(j, llm, zone, trade, prio, blob, directory, sites, msgs)
             # Unreadable trade or urgency: ask, and hold the job until the answer is in; after
             # it, fall back to defaults. An unknown site is not held: it is probed (below).
             need = [t for v, t in ((trade, "problem"), (prio, "urgency")) if v is None and not asked(j["jid"], t)]
@@ -424,7 +453,54 @@ class Agent:
         # P1/P2 dispatches first, then questions, then P3 dispatches; closing repeats and
         # non-requests costs nothing to put off a tick. At most four, and always [wait].
         cmds = urgent + asks + asks_p3 + later + merges + closes
-        return " ".join(cmds[:4] + ["[wait]"])
+        # model answers ride along outside the brackets, so a restarted agent still has them
+        head = ["llm " + " ".join(notes) + " ;"] if notes else []
+        return " ".join(head + cmds[:4] + ["[wait]"])
+
+    # ------------------------------------------------------------------ the model
+    def _consult(self, jobs, msgs, directory, techs, sites, repeats, obs):
+        """Ask the model about each new ticket the rules are unsure of, in parallel, within
+        the tick budget. Returns ({jid: reading}, notes for this reply)."""
+        if self.llm is None or llm_reader is None:
+            return {}, []
+        cache = llm_reader.decode(obs)
+        if not llm_reader.healthy(cache):
+            return cache, []
+        trades = sorted({s for t in techs for s in t["skills"]})
+        todo = []
+        for j in jobs:
+            if j["status"] != "unassigned" or j["jid"] in repeats or j["jid"] in cache:
+                continue
+            blob = self._blob(j, msgs)
+            text = msgs.get(j["jid"], {}).get("text", "").lower()
+            unsure = (j["prio"] is None and self._priority(blob) is None) \
+                or (j["skill"] is None and self._trade(blob) is None) \
+                or (j["zone"] is None and self._site(blob, directory) is None and SITE_REF.search(text))
+            # one call per shift on the first ticket, whatever the rules read: it proves the
+            # gateway works and prices a call, and it can only fill gaps the rules left
+            if unsure or (not cache and not todo):
+                m = msgs.get(j["jid"], {})
+                todo.append((j["jid"], llm_reader.prompt(j["jid"], m.get("sender", j["sender"]), m.get("text", ""),
+                                                         directory, trades, sites, []), set()))
+        todo = todo[:max(0, llm_reader.MAX_CALLS - len(cache))]
+        got, notes = llm_reader.consult(self.llm, todo, trades, sites, self.started)
+        cache.update(got)
+        return cache, notes
+
+    def _with_model(self, j, llm, zone, trade, prio, blob, directory, sites, msgs):
+        """Fill only what the rules left open, never what they read or the game confirmed. A
+        site is only taken when the message refers to a place the directory could not
+        resolve, and never a zone the message names in passing (a decoy)."""
+        c = llm["confidence"]
+        text = msgs.get(j["jid"], {}).get("text", "").lower()
+        if zone is None and llm["zone"] and c >= LLM_SURE and SITE_REF.search(text) \
+                and llm["zone"] in self._zone_odds(llm["trade"] or trade, blob, directory, sites):
+            zone = llm["zone"]
+        if trade is None and llm["trade"] and c >= LLM_FILL:
+            trade = llm["trade"]
+        if prio is None and llm["prio"] in (1, 2, 3) and c >= LLM_FILL:
+            prio = llm["prio"]
+        return zone, trade, prio
 
     def _score(self, t, free_at, at, p, travel, rules):
         """What sending technician t (free at `free_at`, standing at `at`) to plan p is worth."""
