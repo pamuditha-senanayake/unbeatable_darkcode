@@ -78,6 +78,11 @@ SLA_MINUTES = {1: 120, 2: 240, 3: None}
 DURATION_GUESS = {"HVAC": 60, "refrigeration": 60, "electrical": 45, "IT": 40, "lift": 75,
                   "plumbing": 50}
 MAX_QUEUE = 2
+VALUE = {1: 100, 2: 40, 3: 10}
+LATE_FACTOR = 0.5
+TRAVEL_COST = 0.5          # per minute on the road
+OVERTIME_COST = 1.0        # per minute after the technician's own shift end
+HARD_STOP = 660            # 19:00, nobody works later
 
 
 class Agent:
@@ -203,17 +208,26 @@ class Agent:
         plans.sort(key=lambda p: (p["deadline"], p["prio"]))
         assigns = []
         for p in plans:
-            best, best_arrival = None, None
+            # Pick the technician with the best expected net: value earned (half if past the
+            # SLA, nothing past the 19:00 hard stop) minus travel and their own overtime.
+            # A job no technician can do at a profit is left alone, whatever its priority.
+            best, best_arrival, best_net = None, None, 0.0
+            duration = DURATION_GUESS[p["trade"]]
             for t in techs:
                 if p["trade"] not in t["skills"] or t["off_shift"] or len(t["queue"]) >= MAX_QUEUE:
                     continue
-                arrival = t["free_at"] + travel.get(t["at"], {}).get(p["zone"], 30)
-                if best is None or arrival < best_arrival:
-                    best, best_arrival = t, arrival
+                drive = travel.get(t["at"], {}).get(p["zone"], 30)
+                arrival = t["free_at"] + drive
+                finish = arrival + duration
+                own_end = t["shift_end"] or shift_end
+                value = VALUE[p["prio"]] * (1.0 if finish <= p["deadline"] else LATE_FACTOR)
+                if finish > HARD_STOP:
+                    value = 0.0
+                overtime = max(0, finish - max(own_end, t["free_at"]))
+                net = value - TRAVEL_COST * drive - OVERTIME_COST * overtime
+                if net > best_net:
+                    best, best_arrival, best_net = t, arrival, net
             if best is None:
-                continue
-            # would only earn overtime: leave it rather than pay 1/min to finish it late
-            if best_arrival + DURATION_GUESS[p["trade"]] > (best["shift_end"] or shift_end) + 30 and p["prio"] == 3:
                 continue
             assigns.append("[assign %s %s %s]" % (best["tid"], p["job"]["jid"], p["zone"]))
             best["queue"] = best["queue"] + [p["job"]["jid"]]
