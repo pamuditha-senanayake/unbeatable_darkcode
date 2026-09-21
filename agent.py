@@ -302,28 +302,31 @@ class Agent:
         # A P1/P2 whose site is unknown: rather than ask (a fee and a lost tick), send a
         # technician with the right skill to the zone they are standing in (or about to be
         # in). A wrong site costs them 15 minutes, reveals the true zone and they drive
-        # straight on; the drive is the one they would have made anyway. Probes are planned
-        # before everything else, so a queued P3 cannot take the technician away. With no
-        # suitable technician free soon, ask.
+        # straight on; the drive is the one they would have made anyway. P1 probes are
+        # planned first (a queued job must not take the technician a P1 needs to find its
+        # site); P2 probes take their turn in deadline order, so they cannot jump a P1.
+        # With no suitable technician free soon, ask.
         sites = [z for z in travel if z != "Depot"] or list(travel)
-        probes.sort(key=lambda p: (p["deadline"], p["prio"]))
         for p in probes:
-            # One who finishes within 15 min still beats an ask, whose answer only comes
-            # at the next tick.
-            idle = [t for t in techs if p["trade"] in t["skills"] and not t["off_shift"] and not t["queue"]
-                    and t["at"] in travel and t["free_at"] <= now + 15
-                    and t["free_at"] + 15 + 45 + DURATION_GUESS.get(p["trade"], 60) <= (t["shift_end"] or shift_end)]
-            if not idle or not travel:
-                asks.append("[ask %s location]" % p["job"]["jid"])
-                continue
-            t = min(idle, key=lambda t: (t["free_at"], sum(travel.get(t["at"], {}).get(z, 30) for z in sites)))
-            t["queue"] = [(p["job"]["jid"], t["at"])]
-            t["free_at"] += 60 + DURATION_GUESS.get(p["trade"], 60)
+            p["probe"] = True
 
-        # earliest deadline first, and a P1 ahead of a P3 that shares its deadline
-        plans.sort(key=lambda p: (p["deadline"], p["prio"]))
+        # P1 probes, then earliest deadline first, and a P1 ahead of a P3 at the same deadline
+        plans = sorted(plans + probes, key=lambda p: (not (p.get("probe") and p["prio"] == 1), p["deadline"], p["prio"]))
         assigns = []
         for p in plans:
+            if p.get("probe"):
+                # One who finishes within 15 min still beats an ask, whose answer only
+                # comes at the next tick.
+                idle = [t for t in techs if p["trade"] in t["skills"] and not t["off_shift"] and not t["queue"]
+                        and t["at"] in travel and t["free_at"] <= now + 15
+                        and t["free_at"] + 15 + 45 + DURATION_GUESS.get(p["trade"], 60) <= (t["shift_end"] or shift_end)]
+                if not idle or not travel:
+                    asks.append("[ask %s location]" % p["job"]["jid"])
+                    continue
+                t = min(idle, key=lambda t: (t["free_at"], sum(travel.get(t["at"], {}).get(z, 30) for z in sites)))
+                t["queue"] = [(p["job"]["jid"], t["at"])]
+                t["free_at"] += 60 + DURATION_GUESS.get(p["trade"], 60)
+                continue
             # Pick the technician with the best expected net: value earned (half if past the
             # SLA, nothing past the 19:00 hard stop) minus travel and their own overtime.
             # A job no technician can do at a profit is left alone, whatever its priority.
